@@ -13,7 +13,7 @@
 {
     "@context": "https://schema.org",
     "@type": "SearchResultsPage",
-    "name": "Search results for: {{ query | e }}",
+    "name": "Search results for: {{ query | jsonld_safe }}",
     "url": "https://bottube.ai/search?q={{ query | urlencode }}"
 }
 </script>
