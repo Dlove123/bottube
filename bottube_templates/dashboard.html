@@ -373,15 +373,52 @@
             </div>
             {% endif %}
         </div>
-        {% if reward_hold_count %}
-        <div style="min-width:220px;max-width:260px;background:rgba(255,187,0,0.08);border:1px solid rgba(240,185,11,0.28);border-radius:10px;padding:12px 14px;">
-            <div style="font-size:12px;font-weight:800;color:#f0b90b;text-transform:uppercase;letter-spacing:0.4px;">Reward Hold Review</div>
-            <div style="font-size:14px;color:var(--text-primary);margin-top:6px;">
-                {{ reward_hold_count }} comment reward{% if reward_hold_count != 1 %}s{% endif %} pending review
+        {% if reward_hold_count or moderation_hold_count or moderation_messages %}
+        <div style="display:flex;flex-direction:column;gap:12px;min-width:240px;max-width:320px;">
+            {% if reward_hold_count %}
+            <div style="background:rgba(255,187,0,0.08);border:1px solid rgba(240,185,11,0.28);border-radius:10px;padding:12px 14px;">
+                <div style="font-size:12px;font-weight:800;color:#f0b90b;text-transform:uppercase;letter-spacing:0.4px;">Reward Hold Review</div>
+                <div style="font-size:14px;color:var(--text-primary);margin-top:6px;">
+                    {{ reward_hold_count }} reward event{% if reward_hold_count != 1 %}s{% endif %} pending review
+                </div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                    Held amount: {{ "%.4f"|format(reward_hold_amount) }} RTC.
+                </div>
+                {% if reward_hold_breakdown %}
+                <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+                    {% for item in reward_hold_breakdown %}
+                    <span style="background:rgba(0,0,0,0.22);border:1px solid var(--border);border-radius:999px;padding:4px 8px;font-size:11px;color:var(--text-secondary);">
+                        {{ item.event_type|replace('_', ' ') }}: {{ item.hold_count }}
+                    </span>
+                    {% endfor %}
+                </div>
+                {% endif %}
             </div>
-            <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
-                Held amount: {{ "%.4f"|format(reward_hold_amount) }} RTC. Low-trust comment rewards now queue for review instead of settling immediately.
+            {% endif %}
+            {% if moderation_hold_count or moderation_messages %}
+            <div style="background:rgba(62,166,255,0.08);border:1px solid rgba(62,166,255,0.25);border-radius:10px;padding:12px 14px;">
+                <div style="font-size:12px;font-weight:800;color:var(--accent);text-transform:uppercase;letter-spacing:0.4px;">Coaching & Review</div>
+                <div style="font-size:14px;color:var(--text-primary);margin-top:6px;">
+                    {{ moderation_hold_count }} moderation hold{% if moderation_hold_count != 1 %}s{% endif %} pending
+                </div>
+                {% if moderation_messages %}
+                <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;">
+                    {% for msg in moderation_messages %}
+                    <div style="background:rgba(0,0,0,0.22);border:1px solid var(--border);border-radius:8px;padding:8px 10px;">
+                        <div style="font-size:12px;font-weight:700;color:var(--text-primary);">{{ msg.subject }}</div>
+                        <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;line-height:1.4;">
+                            {{ (msg.body or '')[:180] }}{% if (msg.body or '')|length > 180 %}...{% endif %}
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <div style="font-size:12px;color:var(--text-secondary);margin-top:8px;">
+                    Coaching notes from system review will appear here instead of disappearing into silent moderation.
+                </div>
+                {% endif %}
             </div>
+            {% endif %}
         </div>
         {% endif %}
     </div>

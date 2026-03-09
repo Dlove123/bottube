@@ -493,6 +493,12 @@ RTC_REWARD_LIKE_RECEIVED = 0.001  # Receiving a like (paid to video creator)
 COMMENT_REWARD_DAILY_CAP = float(os.environ.get("BOTTUBE_COMMENT_REWARD_DAILY_CAP", "0.02"))
 COMMENT_REWARD_TARGET_DAILY_CAP = float(os.environ.get("BOTTUBE_COMMENT_REWARD_TARGET_DAILY_CAP", "0.005"))
 COMMENT_REWARD_HOLD_THRESHOLD = int(os.environ.get("BOTTUBE_COMMENT_REWARD_HOLD_THRESHOLD", "40"))
+VIEW_REWARD_DAILY_CAP = float(os.environ.get("BOTTUBE_VIEW_REWARD_DAILY_CAP", "0.01"))
+VIEW_REWARD_TARGET_DAILY_CAP = float(os.environ.get("BOTTUBE_VIEW_REWARD_TARGET_DAILY_CAP", "0.003"))
+VIEW_REWARD_HOLD_THRESHOLD = int(os.environ.get("BOTTUBE_VIEW_REWARD_HOLD_THRESHOLD", "36"))
+LIKE_REWARD_DAILY_CAP = float(os.environ.get("BOTTUBE_LIKE_REWARD_DAILY_CAP", "0.04"))
+LIKE_REWARD_TARGET_DAILY_CAP = float(os.environ.get("BOTTUBE_LIKE_REWARD_TARGET_DAILY_CAP", "0.008"))
+LIKE_REWARD_HOLD_THRESHOLD = int(os.environ.get("BOTTUBE_LIKE_REWARD_HOLD_THRESHOLD", "32"))
 RTC_TIP_MIN = 0.001              # Minimum tip amount
 RTC_TIP_MAX = 100.0              # Maximum tip per transaction
 
@@ -2132,6 +2138,178 @@ def _comment_reward_decision(
         return {"awarded": False, "held": True, "risk_score": risk, "reasons": reasons}
 
     award_rtc(db, agent_id, RTC_REWARD_COMMENT, "comment", video_id)
+    return {"awarded": True, "held": False, "risk_score": risk, "reasons": reasons}
+
+
+def _view_reward_decision(
+    db: sqlite3.Connection,
+    *,
+    owner_id: int,
+    viewer_id: int | None,
+    video_id: str,
+    view_event_ref: str,
+    ip_address: str,
+) -> dict:
+    """Score a view reward and either pay it or hold it for review."""
+    now = time.time()
+    reasons: list[str] = []
+    risk = 0
+
+    if viewer_id and viewer_id == owner_id:
+        risk += 100
+        reasons.append("self-view")
+    if not viewer_id:
+        risk += 14
+        reasons.append("anonymous reward source")
+    else:
+        viewer_row = db.execute(
+            "SELECT created_at FROM agents WHERE id = ?",
+            (viewer_id,),
+        ).fetchone()
+        if viewer_row and (now - float(viewer_row["created_at"] or now)) < 86400:
+            risk += 10
+            reasons.append("new viewer account")
+
+        recent_hour = db.execute(
+            "SELECT COUNT(*) FROM views WHERE agent_id = ? AND created_at >= ?",
+            (viewer_id, now - 3600),
+        ).fetchone()[0]
+        if int(recent_hour or 0) >= 20:
+            risk += 16
+            reasons.append("high hourly view velocity")
+
+        same_creator_views = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM views vw
+            JOIN videos v ON v.video_id = vw.video_id
+            WHERE vw.agent_id = ?
+              AND v.agent_id = ?
+              AND vw.created_at >= ?
+            """,
+            (viewer_id, owner_id, now - 86400),
+        ).fetchone()[0]
+        if (int(same_creator_views or 0) * RTC_REWARD_VIEW) >= VIEW_REWARD_TARGET_DAILY_CAP:
+            risk += 16
+            reasons.append("same-creator view reward cap reached")
+
+    same_ip_views = db.execute(
+        """
+        SELECT COUNT(*)
+        FROM views vw
+        JOIN videos v ON v.video_id = vw.video_id
+        WHERE vw.ip_address = ?
+          AND v.agent_id = ?
+          AND vw.created_at >= ?
+        """,
+        (ip_address, owner_id, now - 86400),
+    ).fetchone()[0]
+    if int(same_ip_views or 0) >= 12:
+        risk += 18
+        reasons.append("same-ip creator view concentration")
+
+    today_view_earnings = float(
+        db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM earnings WHERE agent_id = ? AND reason = 'video_view' AND created_at >= ?",
+            (owner_id, now - 86400),
+        ).fetchone()[0]
+        or 0.0
+    )
+    if today_view_earnings >= VIEW_REWARD_DAILY_CAP:
+        risk += 24
+        reasons.append("daily view reward cap reached")
+
+    hold = risk >= VIEW_REWARD_HOLD_THRESHOLD
+    if hold:
+        _queue_reward_hold(
+            db,
+            agent_id=owner_id,
+            event_type="video_view",
+            event_ref=view_event_ref,
+            amount=RTC_REWARD_VIEW,
+            risk_score=risk,
+            reasons=reasons or ["anti-farm hold"],
+        )
+        return {"awarded": False, "held": True, "risk_score": risk, "reasons": reasons}
+
+    award_rtc(db, owner_id, RTC_REWARD_VIEW, "video_view", video_id)
+    return {"awarded": True, "held": False, "risk_score": risk, "reasons": reasons}
+
+
+def _like_reward_decision(
+    db: sqlite3.Connection,
+    *,
+    owner_id: int,
+    voter_id: int,
+    video_id: str,
+    like_event_ref: str,
+) -> dict:
+    """Score a like-received reward and either pay it or hold it for review."""
+    now = time.time()
+    reasons: list[str] = []
+    risk = 0
+
+    if voter_id == owner_id:
+        risk += 100
+        reasons.append("self-like")
+
+    voter_row = db.execute(
+        "SELECT created_at FROM agents WHERE id = ?",
+        (voter_id,),
+    ).fetchone()
+    if voter_row and (now - float(voter_row["created_at"] or now)) < 86400:
+        risk += 12
+        reasons.append("new voter account")
+
+    recent_hour = db.execute(
+        "SELECT COUNT(*) FROM votes WHERE agent_id = ? AND vote = 1 AND created_at >= ?",
+        (voter_id, now - 3600),
+    ).fetchone()[0]
+    if int(recent_hour or 0) >= 15:
+        risk += 18
+        reasons.append("high hourly like velocity")
+
+    same_creator_likes = db.execute(
+        """
+        SELECT COUNT(*)
+        FROM votes vt
+        JOIN videos v ON v.video_id = vt.video_id
+        WHERE vt.agent_id = ?
+          AND vt.vote = 1
+          AND v.agent_id = ?
+          AND vt.created_at >= ?
+        """,
+        (voter_id, owner_id, now - 86400),
+    ).fetchone()[0]
+    if (int(same_creator_likes or 0) * RTC_REWARD_LIKE_RECEIVED) >= LIKE_REWARD_TARGET_DAILY_CAP:
+        risk += 18
+        reasons.append("same-creator like reward cap reached")
+
+    today_like_earnings = float(
+        db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM earnings WHERE agent_id = ? AND reason = 'like_received' AND created_at >= ?",
+            (owner_id, now - 86400),
+        ).fetchone()[0]
+        or 0.0
+    )
+    if today_like_earnings >= LIKE_REWARD_DAILY_CAP:
+        risk += 25
+        reasons.append("daily like reward cap reached")
+
+    hold = risk >= LIKE_REWARD_HOLD_THRESHOLD
+    if hold:
+        _queue_reward_hold(
+            db,
+            agent_id=owner_id,
+            event_type="like_received",
+            event_ref=like_event_ref,
+            amount=RTC_REWARD_LIKE_RECEIVED,
+            risk_score=risk,
+            reasons=reasons or ["anti-farm hold"],
+        )
+        return {"awarded": False, "held": True, "risk_score": risk, "reasons": reasons}
+
+    award_rtc(db, owner_id, RTC_REWARD_LIKE_RECEIVED, "like_received", video_id)
     return {"awarded": True, "held": False, "risk_score": risk, "reasons": reasons}
 
 
@@ -4087,14 +4265,20 @@ def record_view(video_id):
         (video_id, ip, time.time() - VIEW_COOLDOWN),
     ).fetchone()
     if not recent:
-        db.execute(
+        cur = db.execute(
             "INSERT INTO views (video_id, agent_id, ip_address, created_at) VALUES (?, ?, ?, ?)",
             (video_id, agent_id, ip, time.time()),
         )
         db.execute("UPDATE videos SET views = views + 1 WHERE video_id = ?", (video_id,))
         new_views = (row["views"] or 0) + 1
-        # Award RTC to video creator for the view
-        award_rtc(db, row["agent_id"], RTC_REWARD_VIEW, "video_view", video_id)
+        reward_result = _view_reward_decision(
+            db,
+            owner_id=int(row["agent_id"]),
+            viewer_id=agent_id,
+            video_id=video_id,
+            view_event_ref=str(int(cur.lastrowid or 0) or f"{video_id}:{int(time.time())}"),
+            ip_address=ip or "",
+        )
         # Check BAN milestones (100 views, 1000 views)
         check_view_milestones(db, row["agent_id"], video_id, new_views)
         # Record watch history
@@ -4106,11 +4290,14 @@ def record_view(video_id):
                 (agent_id, video_id, time.time()),
             )
         db.commit()
+    else:
+        reward_result = {"awarded": False, "held": False, "risk_score": 0, "reasons": ["deduplicated recent view"]}
 
     d = video_to_dict(row)
     d["agent_name"] = row["agent_name"]
     d["display_name"] = row["display_name"]
     d["views"] = row["views"] + 1
+    d["reward"] = reward_result
     return jsonify(d)
 
 
@@ -4607,6 +4794,7 @@ def vote_video(video_id):
         "SELECT vote FROM votes WHERE agent_id = ? AND video_id = ?",
         (g.agent["id"], video_id),
     ).fetchone()
+    reward_result = {"awarded": False, "held": False, "risk_score": 0, "reasons": []}
 
     if vote_val == 0:
         # Remove vote
@@ -4634,8 +4822,13 @@ def vote_video(video_id):
         # New vote
         if vote_val == 1:
             db.execute("UPDATE videos SET likes = likes + 1 WHERE video_id = ?", (video_id,))
-            # Award RTC to video creator for receiving a like
-            award_rtc(db, video["agent_id"], RTC_REWARD_LIKE_RECEIVED, "like_received", video_id)
+            reward_result = _like_reward_decision(
+                db,
+                owner_id=int(video["agent_id"]),
+                voter_id=int(g.agent["id"]),
+                video_id=video_id,
+                like_event_ref=f"{video_id}:{g.agent['id']}",
+            )
             notify(db, video["agent_id"], "like",
                    f'@{g.agent["agent_name"]} liked your video "{video["title"]}"',
                    from_agent=g.agent["agent_name"], video_id=video_id)
@@ -4655,6 +4848,7 @@ def vote_video(video_id):
         "likes": updated["likes"],
         "dislikes": updated["dislikes"],
         "your_vote": vote_val,
+        "reward": reward_result,
     })
 
 
@@ -4686,6 +4880,7 @@ def web_vote_video(video_id):
         "SELECT vote FROM votes WHERE agent_id = ? AND video_id = ?",
         (g.user["id"], video_id),
     ).fetchone()
+    reward_result = {"awarded": False, "held": False, "risk_score": 0, "reasons": []}
 
     if vote_val == 0:
         if existing:
@@ -4705,7 +4900,13 @@ def web_vote_video(video_id):
     else:
         if vote_val == 1:
             db.execute("UPDATE videos SET likes = likes + 1 WHERE video_id = ?", (video_id,))
-            award_rtc(db, video["agent_id"], RTC_REWARD_LIKE_RECEIVED, "like_received", video_id)
+            reward_result = _like_reward_decision(
+                db,
+                owner_id=int(video["agent_id"]),
+                voter_id=int(g.user["id"]),
+                video_id=video_id,
+                like_event_ref=f"{video_id}:{g.user['id']}",
+            )
             notify(db, video["agent_id"], "like",
                    f'@{g.user["agent_name"]} liked your video "{video["title"]}"',
                    from_agent=g.user["agent_name"], video_id=video_id)
@@ -4722,6 +4923,7 @@ def web_vote_video(video_id):
         "likes": updated["likes"],
         "dislikes": updated["dislikes"],
         "your_vote": vote_val,
+        "reward": reward_result,
     })
 
 
@@ -8153,6 +8355,34 @@ def dashboard_page():
         """,
         (uid,),
     ).fetchone()
+    reward_hold_breakdown = db.execute(
+        """
+        SELECT event_type, COUNT(*) AS hold_count, COALESCE(SUM(amount), 0) AS hold_amount
+        FROM reward_holds
+        WHERE agent_id = ? AND status = 'pending'
+        GROUP BY event_type
+        ORDER BY hold_count DESC, event_type ASC
+        """,
+        (uid,),
+    ).fetchall()
+    moderation_holds_row = db.execute(
+        """
+        SELECT COUNT(*) AS hold_count
+        FROM moderation_holds
+        WHERE target_agent_id = ? AND status = 'pending'
+        """,
+        (uid,),
+    ).fetchone()
+    moderation_messages = db.execute(
+        """
+        SELECT subject, body, created_at
+        FROM messages
+        WHERE to_agent = ? AND message_type = 'moderation'
+        ORDER BY created_at DESC
+        LIMIT 3
+        """,
+        (g.user["agent_name"],),
+    ).fetchall()
 
     # BAN balance (from ban_transactions if Banano is enabled)
     ban_balance = 0.0
@@ -8204,6 +8434,9 @@ def dashboard_page():
         activity_streak_days=activity_streak_days,
         reward_hold_count=int(reward_holds_row["hold_count"] or 0),
         reward_hold_amount=float(reward_holds_row["hold_amount"] or 0),
+        reward_hold_breakdown=reward_hold_breakdown,
+        moderation_hold_count=int(moderation_holds_row["hold_count"] or 0),
+        moderation_messages=moderation_messages,
     )
 
 
@@ -11262,6 +11495,240 @@ def admin_reports():
             for r in rows
         ],
     })
+
+
+@app.route("/api/admin/reward-holds")
+def admin_reward_holds():
+    """Admin view of reward holds."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    status_filter = request.args.get("status", "pending")
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = min(100, max(1, request.args.get("per_page", 20, type=int)))
+    offset = (page - 1) * per_page
+
+    rows = db.execute(
+        """
+        SELECT rh.*, a.agent_name
+        FROM reward_holds rh
+        JOIN agents a ON a.id = rh.agent_id
+        WHERE rh.status = ?
+        ORDER BY rh.created_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (status_filter, per_page, offset),
+    ).fetchall()
+    total = db.execute(
+        "SELECT COUNT(*) FROM reward_holds WHERE status = ?",
+        (status_filter,),
+    ).fetchone()[0]
+
+    return jsonify({
+        "ok": True,
+        "total": total,
+        "holds": [
+            {
+                "id": r["id"],
+                "agent_name": r["agent_name"],
+                "event_type": r["event_type"],
+                "event_ref": r["event_ref"],
+                "amount": float(r["amount"] or 0.0),
+                "risk_score": int(r["risk_score"] or 0),
+                "reasons": _safe_json_loads_list(r["reasons"]),
+                "status": r["status"],
+                "created_at": r["created_at"],
+                "reviewed_at": r["reviewed_at"],
+                "reviewer_note": r["reviewer_note"],
+            }
+            for r in rows
+        ],
+    })
+
+
+@app.route("/api/admin/reward-holds/<int:hold_id>/resolve", methods=["POST"])
+def admin_resolve_reward_hold(hold_id):
+    """Review a reward hold and either credit or dismiss it."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    hold = db.execute(
+        """
+        SELECT rh.*, a.agent_name
+        FROM reward_holds rh
+        JOIN agents a ON a.id = rh.agent_id
+        WHERE rh.id = ?
+        """,
+        (hold_id,),
+    ).fetchone()
+    if not hold:
+        return jsonify({"error": "Reward hold not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "dismiss")
+    reviewer_note = data.get("note", "").strip()[:2000]
+    now = time.time()
+
+    if action == "credit":
+        award_rtc(db, hold["agent_id"], float(hold["amount"] or 0.0), f"{hold['event_type']}_reviewed")
+        status = "credited"
+    elif action == "coach":
+        note = reviewer_note or (
+            f"Your `{hold['event_type']}` reward was held for review. "
+            "Tighten the interaction quality and avoid concentrated low-signal activity before trying again."
+        )
+        _send_coaching_note(
+            db,
+            agent_id=hold["agent_id"],
+            subject=f"BoTTube coaching: held {hold['event_type']} reward",
+            body=note,
+        )
+        status = "dismissed"
+    elif action == "dismiss":
+        status = "dismissed"
+    else:
+        return jsonify({"error": "Invalid action. Use credit, coach, or dismiss."}), 400
+
+    db.execute(
+        "UPDATE reward_holds SET status = ?, reviewed_at = ?, reviewer_note = ? WHERE id = ?",
+        (status, now, reviewer_note, hold_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "action": action, "status": status})
+
+
+@app.route("/api/admin/moderation-holds")
+def admin_moderation_holds():
+    """Admin view of moderation holds."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    status_filter = request.args.get("status", "pending")
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = min(100, max(1, request.args.get("per_page", 20, type=int)))
+    offset = (page - 1) * per_page
+
+    rows = db.execute(
+        """
+        SELECT mh.*, a.agent_name
+        FROM moderation_holds mh
+        LEFT JOIN agents a ON a.id = mh.target_agent_id
+        WHERE mh.status = ?
+        ORDER BY mh.created_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (status_filter, per_page, offset),
+    ).fetchall()
+    total = db.execute(
+        "SELECT COUNT(*) FROM moderation_holds WHERE status = ?",
+        (status_filter,),
+    ).fetchone()[0]
+
+    return jsonify({
+        "ok": True,
+        "total": total,
+        "holds": [
+            {
+                "id": r["id"],
+                "target_type": r["target_type"],
+                "target_ref": r["target_ref"],
+                "target_agent": r["agent_name"],
+                "source": r["source"],
+                "reason": r["reason"],
+                "details": r["details"],
+                "status": r["status"],
+                "recommended_action": r["recommended_action"],
+                "coach_note": r["coach_note"],
+                "created_at": r["created_at"],
+                "reviewed_at": r["reviewed_at"],
+                "reviewer_note": r["reviewer_note"],
+            }
+            for r in rows
+        ],
+    })
+
+
+@app.route("/api/admin/moderation-holds/<int:hold_id>/resolve", methods=["POST"])
+def admin_resolve_moderation_hold(hold_id):
+    """Review a moderation hold with non-destructive defaults."""
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    hold = db.execute("SELECT * FROM moderation_holds WHERE id = ?", (hold_id,)).fetchone()
+    if not hold:
+        return jsonify({"error": "Moderation hold not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "dismiss")
+    reviewer_note = data.get("note", "").strip()[:2000]
+    coach_note = data.get("coach_note", "").strip()[:5000] or hold["coach_note"] or reviewer_note
+    now = time.time()
+
+    status = "dismissed"
+    if action in {"release", "restore"}:
+        if hold["target_type"] == "video":
+            db.execute(
+                """
+                UPDATE videos
+                SET is_removed = 0, removed_reason = ''
+                WHERE video_id = ?
+                  AND removed_reason LIKE 'held for review:%'
+                """,
+                (hold["target_ref"],),
+            )
+        status = "released"
+    elif action == "coach":
+        if coach_note and hold["target_agent_id"]:
+            _send_coaching_note(
+                db,
+                agent_id=hold["target_agent_id"],
+                subject=f"BoTTube coaching: {hold['reason']}",
+                body=coach_note,
+                video_id=hold["target_ref"] if hold["target_type"] == "video" else "",
+            )
+        status = "coached"
+    elif action == "escalate":
+        status = "escalated"
+    elif action == "force_remove":
+        if hold["target_type"] == "video":
+            db.execute(
+                "UPDATE videos SET is_removed = 1, removed_reason = ? WHERE video_id = ?",
+                (f"force removed: {reviewer_note or hold['reason']}", hold["target_ref"]),
+            )
+        elif hold["target_type"] == "comment":
+            db.execute("DELETE FROM comment_votes WHERE comment_id = ?", (int(hold["target_ref"]),))
+            db.execute("DELETE FROM comments WHERE id = ?", (int(hold["target_ref"]),))
+        elif hold["target_type"] == "agent" and hold["target_agent_id"]:
+            db.execute(
+                "UPDATE agents SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
+                (reviewer_note or hold["reason"], now, hold["target_agent_id"]),
+            )
+        status = "removed"
+    elif action == "force_ban":
+        if not hold["target_agent_id"]:
+            return jsonify({"error": "Hold has no target agent to ban"}), 400
+        db.execute(
+            "UPDATE agents SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
+            (reviewer_note or hold["reason"], now, hold["target_agent_id"]),
+        )
+        status = "banned"
+    elif action != "dismiss":
+        return jsonify({"error": "Invalid action. Use dismiss, release, restore, coach, escalate, force_remove, or force_ban."}), 400
+
+    db.execute(
+        "UPDATE moderation_holds SET status = ?, reviewed_at = ?, reviewer_note = ? WHERE id = ?",
+        (status, now, reviewer_note, hold_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "action": action, "status": status})
 
 
 @app.route("/api/admin/reports/<int:report_id>/resolve", methods=["POST"])

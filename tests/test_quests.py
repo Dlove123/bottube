@@ -197,6 +197,18 @@ def test_quest_rewards_are_idempotent_and_leaderboard_updates(client):
 def test_dashboard_renders_quest_board_and_streak(client):
     alice_id = _insert_agent("dashalice", "bottube_sk_dashalice")
     _insert_video(alice_id, "dashvideo01A")
+    with bottube_server.app.app_context():
+        db = bottube_server.get_db()
+        bottube_server._queue_moderation_hold(
+            db,
+            target_type="video",
+            target_ref="dashvideo01A",
+            target_agent_id=alice_id,
+            source="test_dashboard",
+            reason="test coaching hold",
+            coach_note="Tighten the metadata and pacing before the next upload.",
+        )
+        db.commit()
 
     client.patch(
         "/api/agents/me/profile",
@@ -213,6 +225,7 @@ def test_dashboard_renders_quest_board_and_streak(client):
     html = resp.get_data(as_text=True)
     assert "Quest Board" in html
     assert "day streak" in html
+    assert "Coaching & Review" in html
 
 
 def test_suspicious_comment_reward_is_held_for_review(client):
@@ -426,3 +439,145 @@ def test_comment_cleanup_defaults_to_hold_without_deleting(client):
     assert comment_count == 2
     assert hold_count >= 1
     assert moderation_messages >= 1
+
+
+def test_self_view_reward_is_held_for_review(client):
+    owner_id = _insert_agent("viewowner", "bottube_sk_viewowner")
+    _insert_video(owner_id, "viewhold01A")
+
+    resp = client.get(
+        "/api/videos/viewhold01A/view",
+        headers={"X-API-Key": "bottube_sk_viewowner", "X-Real-IP": "10.0.0.9"},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["reward"]["held"] is True
+    assert body["reward"]["awarded"] is False
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        hold_count = conn.execute(
+            "SELECT COUNT(*) FROM reward_holds WHERE agent_id = ? AND event_type = 'video_view' AND status = 'pending'",
+            (owner_id,),
+        ).fetchone()[0]
+        reward_count = conn.execute(
+            "SELECT COUNT(*) FROM earnings WHERE agent_id = ? AND reason = 'video_view'",
+            (owner_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert hold_count == 1
+    assert reward_count == 0
+
+
+def test_like_reward_hold_can_be_credited_by_admin(client):
+    owner_id = _insert_agent("likeowner", "bottube_sk_likeowner")
+    voter_id = _insert_agent("likevoter", "bottube_sk_likevoter")
+    assert voter_id > 0
+    _insert_video(owner_id, "likehold09A")
+
+    with bottube_server.app.app_context():
+        db = bottube_server.get_db()
+        for idx in range(15):
+            video_id = f"likehist{idx:02d}A"
+            db.execute(
+                "INSERT INTO videos (video_id, agent_id, title, filename, created_at, is_removed) VALUES (?, ?, ?, ?, ?, 0)",
+                (video_id, owner_id, f"History {idx}", f"{video_id}.mp4", 5.0 + idx),
+            )
+            db.execute(
+                "INSERT INTO votes (agent_id, video_id, vote, created_at) VALUES (?, ?, 1, ?)",
+                (voter_id, video_id, time.time()),
+            )
+        db.commit()
+
+    resp = client.post(
+        "/api/videos/likehold09A/vote",
+        headers={"X-API-Key": "bottube_sk_likevoter"},
+        json={"vote": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["reward"]["held"] is True
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        hold_id = conn.execute(
+            """
+            SELECT id FROM reward_holds
+            WHERE agent_id = ? AND event_type = 'like_received' AND event_ref = ?
+            """,
+            (owner_id, f"likehold09A:{voter_id}"),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    resp = client.post(
+        f"/api/admin/reward-holds/{hold_id}/resolve",
+        headers={"X-Admin-Key": bottube_server.ADMIN_KEY},
+        json={"action": "credit", "note": "manual review approved"},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "credited"
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        hold_status = conn.execute(
+            "SELECT status FROM reward_holds WHERE id = ?",
+            (hold_id,),
+        ).fetchone()[0]
+        reward_count = conn.execute(
+            "SELECT COUNT(*) FROM earnings WHERE agent_id = ? AND reason = 'like_received_reviewed'",
+            (owner_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert hold_status == "credited"
+    assert reward_count == 1
+
+
+def test_moderation_hold_release_restores_video(client):
+    owner_id = _insert_agent("releaseowner", "bottube_sk_releaseowner")
+    _insert_video(owner_id, "releasevid1A")
+
+    resp = client.post(
+        "/api/admin/remove-video",
+        headers={"X-Admin-Key": bottube_server.ADMIN_KEY},
+        json={"video_id": "releasevid1A", "reason": "needs coaching"},
+    )
+    assert resp.status_code == 200
+    hold_id = resp.get_json()["hold_id"]
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        is_removed = conn.execute(
+            "SELECT is_removed FROM videos WHERE video_id = 'releasevid1A'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert is_removed == 1
+
+    resp = client.post(
+        f"/api/admin/moderation-holds/{hold_id}/resolve",
+        headers={"X-Admin-Key": bottube_server.ADMIN_KEY},
+        json={"action": "release", "note": "restored after review"},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "released"
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        video_row = conn.execute(
+            "SELECT is_removed, removed_reason FROM videos WHERE video_id = 'releasevid1A'",
+        ).fetchone()
+        hold_status = conn.execute(
+            "SELECT status FROM moderation_holds WHERE id = ?",
+            (hold_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert video_row[0] == 0
+    assert video_row[1] == ""
+    assert hold_status == "released"
