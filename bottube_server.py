@@ -1470,6 +1470,35 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_agent ON agent_quests(agent_id, completed_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_rewarded ON agent_quests(rewarded_at DESC)")
 
+    # Syndication queue for distributing uploads to external platforms
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS syndication_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL,
+            video_title TEXT NOT NULL,
+            agent_id INTEGER NOT NULL,
+            agent_name TEXT NOT NULL,
+            target_platform TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            priority INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3,
+            error_message TEXT DEFAULT '',
+            metadata TEXT DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            processed_at REAL DEFAULT NULL,
+            completed_at REAL DEFAULT NULL,
+            FOREIGN KEY (agent_id) REFERENCES agents(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_state ON syndication_queue(state, priority DESC, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_video ON syndication_queue(video_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_agent ON syndication_queue(agent_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_platform ON syndication_queue(target_platform, state)")
+
     conn.commit()
     _sync_default_quests(conn)
     conn.commit()
