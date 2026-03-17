@@ -446,7 +446,7 @@ def _normalize_referral_track(raw: str, default: str = "both") -> str:
     return default
 
 
-def _referral_track_for_agent(row: sqlite3.Row | dict | None) -> str:
+def _referral_track_for_agent(row) -> str:
     if not row:
         return "agent"
     return "human" if int(row["is_human"] or 0) else "agent"
@@ -485,7 +485,7 @@ def _referral_get_code_row(db: sqlite3.Connection, code: str):
     ).fetchone()
 
 
-def _referral_build_summary(db: sqlite3.Connection, agent_id: int, *, include_recent: bool = True) -> dict | None:
+def _referral_build_summary(db: sqlite3.Connection, agent_id: int, *, include_recent: bool = True):
     row = db.execute(
         """
         SELECT code, hits, signups, first_uploads, created_at, COALESCE(allowed_track, 'both') AS allowed_track
@@ -709,7 +709,7 @@ def _referral_mark_rtc_native_action(
     agent_id: int,
     *,
     evidence_ref: str,
-    occurred_at: float | None = None,
+    occurred_at=None,
 ) -> None:
     invite = db.execute(
         "SELECT first_rtc_native_action_at FROM referral_invites WHERE invitee_agent_id = ?",
@@ -7569,12 +7569,15 @@ def search_videos():
 
     # Sort with relevance scoring (issue #425)
     sort_key = request.args.get("sort", "relevance").lower()
-    
+
+    # Build base params for COUNT query (before relevance scoring params are added)
+    base_params = list(params)
+
     if sort_key == "relevance":
         # Relevance scoring: exact match > title match > description match > tags
         # Boost by engagement (views + likes)
         order_by = """
-            CASE 
+            CASE
                 WHEN LOWER(v.title) = ? THEN 100
                 WHEN LOWER(v.title) LIKE ? THEN 80
                 WHEN LOWER(v.description) LIKE ? THEN 40
@@ -7586,7 +7589,7 @@ def search_videos():
             DESC,
             v.created_at DESC
         """
-        params.extend([q_lower, like_q, like_q, like_q])
+        # Don't extend params here - we'll add relevance params in the main query
     else:
         SORT_MAP = {
             "views": "v.views DESC, v.created_at DESC",
@@ -7598,7 +7601,7 @@ def search_videos():
 
     total = db.execute(
         f"SELECT COUNT(*) FROM videos v JOIN agents a ON v.agent_id = a.id WHERE {where}",
-        params,
+        base_params,
     ).fetchone()[0]
 
     rows = db.execute(
@@ -8146,7 +8149,31 @@ def _get_trending_videos(db, limit=20, category=None):
     query_limit = max(limit * 3, limit)
 
     category_filter = "AND v.category = ?" if category else ""
-    category_param = [category] if category else []
+    category_params = [category] if category else []
+
+    # Build parameters in the order they appear in the SQL query
+    # Placeholders order:
+    # 1-2. recency_bonus CASE (v.created_at > ?)
+    # 3. recent_views subquery (created_at > ?)
+    # 4. recent_comments subquery (created_at > ?)
+    # 5. category filter (v.category = ?) - if provided
+    # 6-7. ORDER BY CASE (v.created_at > ?)
+    # 8. novelty_score multiplication
+    # 9-10. penalty CASE statements
+    # 11. LIMIT
+    params = [
+        cutoff_6h,       # 1. recency_bonus first
+        cutoff_24h,      # 2. recency_bonus second
+        cutoff_24h,      # 3. recent_views subquery
+        cutoff_24h,      # 4. recent_comments subquery
+    ] + category_params + [
+        cutoff_6h,       # 6. ORDER BY CASE first
+        cutoff_24h,      # 7. ORDER BY CASE second
+        NOVELTY_WEIGHT,  # 8. novelty_score
+        TRENDING_PENALTY_HIGH_SIMILARITY,  # 9. high_similarity penalty
+        TRENDING_PENALTY_LOW_INFO,  # 10. low_info penalty
+        query_limit,     # 11. LIMIT
+    ]
 
     rows = db.execute(
         f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human,
@@ -8172,36 +8199,25 @@ def _get_trending_videos(db, limit=20, category=None):
            WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0 {category_filter}
            ORDER BY (
                COALESCE(rv.recent_views, 0) * 2
-               + v.likes * 3
+               + COALESCE(v.likes, 0) * 3
                + COALESCE(rc.recent_comments, 0) * 4
                + CASE
                    WHEN v.created_at > ? THEN 10
                    WHEN v.created_at > ? THEN 5
                    ELSE 0
                END
-               + (v.novelty_score * ?)
+               + (COALESCE(v.novelty_score, 0) * ?)
                + CASE
-                   WHEN v.novelty_flags LIKE '%high_similarity%' THEN -?
+                   WHEN COALESCE(v.novelty_flags, '') LIKE '%high_similarity%' THEN -?
                    ELSE 0
                END
                + CASE
-                   WHEN v.novelty_flags LIKE '%low_info%' THEN -?
+                   WHEN COALESCE(v.novelty_flags, '') LIKE '%low_info%' THEN -?
                    ELSE 0
                END
            ) DESC, v.created_at DESC
            LIMIT ?""",
-        (
-            cutoff_6h,
-            cutoff_24h,
-            cutoff_24h,
-            cutoff_24h,
-            cutoff_6h,
-            cutoff_24h,
-            NOVELTY_WEIGHT,
-            TRENDING_PENALTY_HIGH_SIMILARITY,
-            TRENDING_PENALTY_LOW_INFO,
-            query_limit,
-        ) + tuple(category_param),
+        tuple(params),
     ).fetchall()
     if TRENDING_AGENT_CAP <= 0:
         return rows[:limit]
@@ -8221,10 +8237,10 @@ def _get_trending_videos(db, limit=20, category=None):
 
 def _get_rising_videos(db, limit=10, category=None):
     """Get rising videos with high velocity (issue #425).
-    
+
     Rising = videos with high recent engagement relative to lifetime engagement.
     Focuses on videos uploaded in last 7 days with accelerating views/likes.
-    
+
     Args:
         db: Database connection
         limit: Max videos to return
@@ -8233,9 +8249,29 @@ def _get_rising_videos(db, limit=10, category=None):
     now = time.time()
     cutoff_7d = now - 604800  # 7 days
     cutoff_24h = now - 86400
-    
+    cutoff_6h = now - 21600  # 6 hours
+
     category_filter = "AND v.category = ?" if category else ""
-    category_param = [category] if category else []
+    category_params = [category] if category else []
+
+    # Build parameters in the order they appear in the SQL query
+    # Placeholders order:
+    # 1. recent_views subquery (created_at > ?)
+    # 2. week_views subquery (created_at > ?)
+    # 3. recent_likes subquery (created_at > ?)
+    # 4. WHERE v.created_at > ?
+    # 5. category filter (v.category = ?) - if provided
+    # 6. ORDER BY CASE (v.created_at > ?)
+    # 7. LIMIT
+    params = [
+        cutoff_24h,      # 1. recent_views subquery
+        cutoff_7d,       # 2. week_views subquery
+        cutoff_24h,      # 3. recent_likes subquery
+        cutoff_7d,       # 4. WHERE v.created_at > ?
+    ] + category_params + [
+        cutoff_6h,       # 6. ORDER BY CASE
+        limit * 2,       # 7. LIMIT
+    ]
 
     rows = db.execute(
         f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human,
@@ -8259,7 +8295,7 @@ def _get_rising_videos(db, limit=10, category=None):
                FROM votes WHERE created_at > ? AND vote = 1
                GROUP BY video_id
            ) rl ON rl.video_id = v.video_id
-           WHERE v.is_removed = 0 
+           WHERE v.is_removed = 0
              AND COALESCE(a.is_banned, 0) = 0
              AND v.created_at > ?
              AND v.views > 0
@@ -8270,14 +8306,7 @@ def _get_rising_videos(db, limit=10, category=None):
                + CASE WHEN v.created_at > ? THEN 2 ELSE 0 END
            ) DESC, v.created_at DESC
            LIMIT ?""",
-        (
-            cutoff_24h,
-            cutoff_7d,
-            cutoff_24h,
-            cutoff_7d,
-            cutoff_6h,
-            limit * 2,
-        ) + tuple(category_param),
+        tuple(params),
     ).fetchall()
     return rows[:limit]
 
@@ -12826,7 +12855,8 @@ app.register_blueprint(wrtc_bp)
 # wRTC Bridge Integration (Base L2 / Ethereum)
 from base_wrtc_bridge_blueprint import base_wrtc_bp, init_base_wrtc_tables
 import sqlite3 as _base_wrtc_sqlite3
-_base_wrtc_db = _base_wrtc_sqlite3.connect('/root/bottube/bottube.db')
+_base_wrtc_db_path = os.environ.get("BOTTUBE_DB_PATH", str(DB_PATH))
+_base_wrtc_db = _base_wrtc_sqlite3.connect(_base_wrtc_db_path)
 init_base_wrtc_tables(_base_wrtc_db)
 _base_wrtc_db.close()
 app.register_blueprint(base_wrtc_bp)
