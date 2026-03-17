@@ -7039,10 +7039,41 @@ _CATEGORY_REDIRECTS = {
     "music-video": "music",
 }
 
+# Related categories mapping (issue #425)
+_CATEGORY_RELATED = {
+    "ai-art": ["3d", "animation", "creative"],
+    "music": ["comedy", "animation", "memes"],
+    "comedy": ["memes", "vlog", "other"],
+    "science-tech": ["education", "3d", "news"],
+    "gaming": ["retro", "comedy", "memes"],
+    "nature": ["meditation", "adventure", "weather"],
+    "education": ["science-tech", "news", "other"],
+    "animation": ["ai-art", "3d", "film"],
+    "vlog": ["meditation", "adventure", "other"],
+    "horror": ["film", "creative", "other"],
+    "retro": ["gaming", "music", "memes"],
+    "food": ["education", "vlog", "other"],
+    "meditation": ["nature", "music", "other"],
+    "adventure": ["nature", "travel", "film"],
+    "film": ["animation", "horror", "creative"],
+    "memes": ["comedy", "gaming", "retro"],
+    "3d": ["ai-art", "animation", "gaming"],
+    "politics": ["news", "other"],
+    "news": ["politics", "weather", "other"],
+    "weather": ["news", "nature", "other"],
+    "other": [],
+}
+
 
 @app.route("/category/<cat_id>")
 def category_browse(cat_id):
-    """Browse videos by category with sorting."""
+    """Browse videos by category with sorting and related categories (issue #425).
+    
+    Features:
+    - Sort by recent, views, or likes
+    - Shows related categories for discovery
+    - Shows trending within category
+    """
     if cat_id in _CATEGORY_REDIRECTS:
         return redirect(url_for("category_browse", cat_id=_CATEGORY_REDIRECTS[cat_id]), code=301)
     cat = CATEGORY_MAP.get(cat_id)
@@ -7067,13 +7098,64 @@ def category_browse(cat_id):
         (cat_id,),
     ).fetchall()
 
+    # Get related categories (issue #425)
+    related_cat_ids = _CATEGORY_RELATED.get(cat_id, [])
+    related_categories = [
+        {"id": c["id"], "name": c["name"], "icon": c["icon"]}
+        for c in VIDEO_CATEGORIES
+        if c["id"] in related_cat_ids
+    ][:4]
+    
+    # Get trending within category (issue #425)
+    trending_in_category = _get_trending_videos(db, limit=5, category=cat_id)
+
     return render_template(
         "category.html",
         cat=cat,
-        category=cat,  # some templates expect `category` instead of `cat`
+        category=cat,
         videos=videos,
         sort=sort,
+        related_categories=related_categories,
+        trending_in_category=trending_in_category,
     )
+
+
+@app.route("/api/categories/<cat_id>/related")
+def get_related_categories(cat_id):
+    """Get related categories for discovery (issue #425).
+    
+    Returns categories that are semantically related or have overlapping audiences.
+    """
+    if cat_id in _CATEGORY_REDIRECTS:
+        cat_id = _CATEGORY_REDIRECTS[cat_id]
+    
+    if cat_id not in CATEGORY_MAP:
+        return jsonify({"error": "Category not found"}), 404
+    
+    related_cat_ids = _CATEGORY_RELATED.get(cat_id, [])
+    db = get_db()
+    
+    # Get video counts for related categories
+    related = []
+    for rel_id in related_cat_ids:
+        if rel_id in CATEGORY_MAP:
+            count = db.execute(
+                "SELECT COUNT(*) FROM videos WHERE category = ? AND is_removed = 0",
+                (rel_id,)
+            ).fetchone()[0]
+            c = CATEGORY_MAP[rel_id]
+            related.append({
+                "id": rel_id,
+                "name": c["name"],
+                "icon": c["icon"],
+                "desc": c["desc"],
+                "video_count": count,
+            })
+    
+    return jsonify({
+        "category": cat_id,
+        "related": related,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -7284,19 +7366,110 @@ def web_subscribe(agent_name):
 
 
 # ---------------------------------------------------------------------------
-# Search
+# Search (Issue #425: Discoverability Enhancements)
 # ---------------------------------------------------------------------------
+
+@app.route("/api/search/suggestions")
+def search_suggestions():
+    """Get search autocomplete suggestions (issue #425).
+    
+    Returns popular search terms, matching categories, tags, and agents.
+    
+    Query parameters:
+        q - partial query string (min 2 chars)
+        limit - max suggestions (default 8, max 20)
+    """
+    ip = _get_client_ip()
+    if not _rate_limit(f"suggest:{ip}", 60, 60):
+        return jsonify({"error": "Rate limit exceeded"}), 429
+    
+    q = request.args.get("q", "").strip().lower()
+    if len(q) < 2:
+        return jsonify({"suggestions": [], "categories": [], "agents": [], "tags": []})
+    
+    limit = min(20, max(1, request.args.get("limit", 8, type=int)))
+    db = get_db()
+    like_q = f"%{q}%"
+    
+    # Popular search terms from video titles (cached approach)
+    popular = db.execute(
+        """SELECT DISTINCT title FROM videos 
+           WHERE is_removed = 0 AND title LIKE ?
+           ORDER BY views DESC
+           LIMIT ?""",
+        (like_q, limit // 2)
+    ).fetchall()
+    suggestions = [row[0] for row in popular[:limit // 2]]
+    
+    # Matching categories
+    matching_cats = [
+        {"id": c["id"], "name": c["name"], "icon": c["icon"]}
+        for c in VIDEO_CATEGORIES
+        if q in c["id"].lower() or q in c["name"].lower()
+    ][:3]
+    
+    # Matching agents with video counts
+    agents = db.execute(
+        """SELECT a.agent_name, a.display_name, COUNT(v.video_id) as video_count
+           FROM agents a
+           LEFT JOIN videos v ON a.id = v.agent_id AND v.is_removed = 0
+           WHERE COALESCE(a.is_banned, 0) = 0
+             AND (a.agent_name LIKE ? OR a.display_name LIKE ?)
+           GROUP BY a.id
+           HAVING video_count > 0
+           ORDER BY video_count DESC
+           LIMIT ?""",
+        (like_q, like_q, limit // 3)
+    ).fetchall()
+    agent_suggestions = [
+        {"agent_name": row["agent_name"], "display_name": row["display_name"], "video_count": row["video_count"]}
+        for row in agents
+    ]
+    
+    # Extract matching tags
+    tags = db.execute(
+        """SELECT DISTINCT tags FROM videos 
+           WHERE is_removed = 0 AND tags LIKE ?
+           LIMIT ?""",
+        (like_q, 20)
+    ).fetchall()
+    tag_list = []
+    for row in tags:
+        for tag in row[0].split(",") if row[0] else []:
+            tag = tag.strip().lower()
+            if q in tag and tag not in tag_list:
+                tag_list.append(tag)
+    tag_suggestions = tag_list[:limit // 3]
+    
+    return jsonify({
+        "query": q,
+        "suggestions": suggestions,
+        "categories": matching_cats,
+        "agents": agent_suggestions,
+        "tags": tag_suggestions,
+    })
+
 
 @app.route("/api/search")
 def search_videos():
-    """Search videos by title, description, tags, or agent.
+    """Search videos by title, description, tags, agent, or captions.
 
-    Optional filters (issue #188):
-      category  - comma-separated category IDs (e.g. "retro,science-tech")
-      after     - ISO date or Unix timestamp lower bound
-      before    - ISO date or Unix timestamp upper bound
-      min_views - minimum view count (engagement threshold)
-      sort      - views|likes|recent|trending (default: views)
+    Issue #425: Enhanced discoverability with relevance scoring.
+    
+    Query parameters:
+        q         - search query (required)
+        category  - comma-separated category IDs (e.g. "retro,science-tech")
+        agent     - filter by agent_name
+        tag       - filter by tag (comma-separated)
+        after     - ISO date or Unix timestamp lower bound
+        before    - ISO date or Unix timestamp upper bound
+        min_views - minimum view count (engagement threshold)
+        sort      - views|likes|recent|trending|relevance (default: relevance)
+        page      - page number (default 1)
+        per_page  - items per page (default 20, max 50)
+    
+    Returns:
+        JSON with videos, pagination info, and applied filters.
     """
     ip = _get_client_ip()
     if not _rate_limit(f"search:{ip}", 30, 60):
@@ -7312,8 +7485,9 @@ def search_videos():
 
     db = get_db()
     like_q = f"%{q}%"
+    q_lower = q.lower()
 
-    # Build dynamic WHERE clauses
+    # Build dynamic WHERE clauses with relevance scoring (issue #425)
     search_conditions = [
         "v.title LIKE ?",
         "v.description LIKE ?",
@@ -7321,6 +7495,8 @@ def search_videos():
         "a.agent_name LIKE ?",
     ]
     params = [like_q, like_q, like_q, like_q]
+    
+    # Caption search
     caption_video_ids = find_caption_video_ids(q, limit=500)
     if caption_video_ids:
         placeholders = ",".join("?" for _ in caption_video_ids)
@@ -7341,6 +7517,20 @@ def search_videos():
             placeholders = ",".join("?" for _ in cats)
             conditions.append(f"v.category IN ({placeholders})")
             params.extend(cats)
+
+    # Agent filter (issue #425)
+    agent_param = request.args.get("agent", "").strip()
+    if agent_param:
+        conditions.append("a.agent_name = ?")
+        params.append(agent_param)
+
+    # Tag filter (issue #425)
+    tag_param = request.args.get("tag", "").strip()
+    if tag_param:
+        tags = [t.strip() for t in tag_param.split(",") if t.strip()]
+        for tag in tags:
+            conditions.append("v.tags LIKE ?")
+            params.append(f"%{tag}%")
 
     # Date range filters
     def _parse_ts(val):
@@ -7377,15 +7567,34 @@ def search_videos():
 
     where = " AND ".join(conditions)
 
-    # Sort (whitelist to prevent injection)
-    SORT_MAP = {
-        "views": "v.views DESC, v.created_at DESC",
-        "likes": "v.likes DESC, v.created_at DESC",
-        "recent": "v.created_at DESC",
-        "trending": "(v.views + v.likes * 3) DESC, v.created_at DESC",
-    }
-    sort_key = request.args.get("sort", "views").lower()
-    order_by = SORT_MAP.get(sort_key, SORT_MAP["views"])
+    # Sort with relevance scoring (issue #425)
+    sort_key = request.args.get("sort", "relevance").lower()
+    
+    if sort_key == "relevance":
+        # Relevance scoring: exact match > title match > description match > tags
+        # Boost by engagement (views + likes)
+        order_by = """
+            CASE 
+                WHEN LOWER(v.title) = ? THEN 100
+                WHEN LOWER(v.title) LIKE ? THEN 80
+                WHEN LOWER(v.description) LIKE ? THEN 40
+                WHEN LOWER(v.tags) LIKE ? THEN 30
+                ELSE 10
+            END
+            + (v.views / 100.0)
+            + (v.likes / 10.0)
+            DESC,
+            v.created_at DESC
+        """
+        params.extend([q_lower, like_q, like_q, like_q])
+    else:
+        SORT_MAP = {
+            "views": "v.views DESC, v.created_at DESC",
+            "likes": "v.likes DESC, v.created_at DESC",
+            "recent": "v.created_at DESC",
+            "trending": "(v.views + v.likes * 3) DESC, v.created_at DESC",
+        }
+        order_by = SORT_MAP.get(sort_key, SORT_MAP["views"])
 
     total = db.execute(
         f"SELECT COUNT(*) FROM videos v JOIN agents a ON v.agent_id = a.id WHERE {where}",
@@ -7393,12 +7602,19 @@ def search_videos():
     ).fetchone()[0]
 
     rows = db.execute(
-        f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url
+        f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url,
+                   CASE 
+                       WHEN LOWER(v.title) = ? THEN 1
+                       WHEN LOWER(v.title) LIKE ? THEN 2
+                       WHEN LOWER(v.description) LIKE ? THEN 3
+                       WHEN LOWER(v.tags) LIKE ? THEN 4
+                       ELSE 5
+                   END as relevance_rank
            FROM videos v JOIN agents a ON v.agent_id = a.id
            WHERE {where}
-           ORDER BY {order_by}
+           ORDER BY {order_by if sort_key != 'relevance' else 'relevance_rank, v.created_at DESC'}
            LIMIT ? OFFSET ?""",
-        params + [per_page, offset],
+        params + ([q_lower, like_q, like_q, like_q] if sort_key == "relevance" else []) + [per_page, offset],
     ).fetchall()
 
     videos = []
@@ -7407,6 +7623,8 @@ def search_videos():
         d["agent_name"] = row["agent_name"]
         d["display_name"] = row["display_name"]
         d["avatar_url"] = row["avatar_url"]
+        if sort_key == "relevance":
+            d["relevance_rank"] = row["relevance_rank"]
         videos.append(d)
 
     return jsonify({
@@ -7418,6 +7636,8 @@ def search_videos():
         "pages": math.ceil(total / per_page) if total else 0,
         "filters": {
             "category": cat_param or None,
+            "agent": agent_param or None,
+            "tag": tag_param or None,
             "after": after_ts,
             "before": before_ts,
             "min_views": min_views if min_views > 0 else None,
@@ -7635,6 +7855,89 @@ def get_video_analytics(video_id):
     })
 
 
+@app.route("/api/videos/<video_id>/related")
+def get_related_videos(video_id):
+    """Get related videos based on category, tags, and agent (issue #425).
+    
+    Related videos are found using:
+    1. Same category (highest priority)
+    2. Shared tags
+    3. Same agent (other videos)
+    
+    Query parameters:
+        limit - max results (default 12, max 30)
+    
+    Returns:
+        JSON with related videos list.
+    """
+    db = get_db()
+    video = db.execute(
+        "SELECT * FROM videos WHERE video_id = ? AND is_removed = 0",
+        (video_id,),
+    ).fetchone()
+    if not video:
+        return jsonify({"error": "Video not found"}), 404
+    
+    limit = min(30, max(1, request.args.get("limit", 12, type=int)))
+    
+    # Parse video tags
+    video_tags = [t.strip() for t in (video["tags"] or "").split(",") if t.strip()]
+    tag_conditions = []
+    tag_params = []
+    for tag in video_tags[:5]:  # Limit to top 5 tags
+        tag_conditions.append("v.tags LIKE ?")
+        tag_params.append(f"%{tag}%")
+    
+    tag_clause = " OR ".join(tag_conditions) if tag_conditions else "0"
+    
+    # Find related videos with scoring
+    # Score: same category (10) + shared tags (5 each) + same agent (3)
+    related = db.execute(
+        f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url,
+                   (
+                       CASE WHEN v.category = ? THEN 10 ELSE 0 END
+                       + (
+                           SELECT COUNT(*) * 5 FROM (
+                               SELECT DISTINCT tag FROM (
+                                   SELECT TRIM(value) as tag FROM json_each('["{",".join(video_tags)}"])
+                               )
+                           ) WHERE v.tags LIKE '%' || tag || '%'
+                       )
+                       + CASE WHEN v.agent_id = ? THEN 3 ELSE 0 END
+                   ) AS relevance_score
+           FROM videos v
+           JOIN agents a ON v.agent_id = a.id
+           WHERE v.video_id != ?
+             AND v.is_removed = 0
+             AND COALESCE(a.is_banned, 0) = 0
+             AND (v.category = ? OR v.agent_id = ? OR ({tag_clause}))
+           ORDER BY relevance_score DESC, v.views DESC, v.created_at DESC
+           LIMIT ?""",
+        (
+            video["category"],
+            video["agent_id"],
+            video_id,
+            video["category"],
+            video["agent_id"],
+        ) + tuple(tag_params) + (limit,),
+    ).fetchall()
+    
+    videos = []
+    for row in related:
+        d = video_to_dict(row)
+        d["agent_name"] = row["agent_name"]
+        d["display_name"] = row["display_name"]
+        d["avatar_url"] = row["avatar_url"]
+        d["relevance_score"] = row["relevance_score"]
+        videos.append(d)
+    
+    return jsonify({
+        "video_id": video_id,
+        "related_videos": videos,
+        "count": len(videos),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Agent Social Graph (issue #190)
 # ---------------------------------------------------------------------------
@@ -7821,24 +8124,32 @@ def social_graph():
 
 
 # ---------------------------------------------------------------------------
-# Trending / Feed
+# Trending / Feed (Issue #425: Discoverability Enhancements)
 # ---------------------------------------------------------------------------
 
-def _get_trending_videos(db, limit=20):
-    """Compute trending videos with improved scoring.
+def _get_trending_videos(db, limit=20, category=None):
+    """Compute trending videos with improved scoring (issue #425).
 
     Score = (recent_views_24h * 2) + (likes * 3) + (recent_comments_24h * 4)
             + recency_bonus + (novelty_score * NOVELTY_WEIGHT)
             + penalties (duplicate/low-info)
     recency_bonus: +10 if uploaded < 6h ago, +5 if < 24h ago
+    
+    Args:
+        db: Database connection
+        limit: Max videos to return
+        category: Optional category filter (issue #425)
     """
     now = time.time()
     cutoff_24h = now - 86400
     cutoff_6h = now - 21600
     query_limit = max(limit * 3, limit)
 
+    category_filter = "AND v.category = ?" if category else ""
+    category_param = [category] if category else []
+
     rows = db.execute(
-        """SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human,
+        f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human,
                   COALESCE(rv.recent_views, 0) AS recent_views,
                   COALESCE(rc.recent_comments, 0) AS recent_comments,
                   CASE
@@ -7858,7 +8169,7 @@ def _get_trending_videos(db, limit=20):
                FROM comments WHERE created_at > ?
                GROUP BY video_id
            ) rc ON rc.video_id = v.video_id
-           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
+           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0 {category_filter}
            ORDER BY (
                COALESCE(rv.recent_views, 0) * 2
                + v.likes * 3
@@ -7890,7 +8201,7 @@ def _get_trending_videos(db, limit=20):
             TRENDING_PENALTY_HIGH_SIMILARITY,
             TRENDING_PENALTY_LOW_INFO,
             query_limit,
-        ),
+        ) + tuple(category_param),
     ).fetchall()
     if TRENDING_AGENT_CAP <= 0:
         return rows[:limit]
@@ -7908,11 +8219,84 @@ def _get_trending_videos(db, limit=20):
     return filtered
 
 
+def _get_rising_videos(db, limit=10, category=None):
+    """Get rising videos with high velocity (issue #425).
+    
+    Rising = videos with high recent engagement relative to lifetime engagement.
+    Focuses on videos uploaded in last 7 days with accelerating views/likes.
+    
+    Args:
+        db: Database connection
+        limit: Max videos to return
+        category: Optional category filter
+    """
+    now = time.time()
+    cutoff_7d = now - 604800  # 7 days
+    cutoff_24h = now - 86400
+    
+    category_filter = "AND v.category = ?" if category else ""
+    category_param = [category] if category else []
+
+    rows = db.execute(
+        f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human,
+                  COALESCE(rv24.recent_views, 0) AS recent_views,
+                  COALESCE(rv7d.week_views, 0) AS week_views,
+                  COALESCE(rl.recent_likes, 0) AS recent_likes
+           FROM videos v
+           JOIN agents a ON v.agent_id = a.id
+           LEFT JOIN (
+               SELECT video_id, COUNT(*) AS recent_views
+               FROM views WHERE created_at > ?
+               GROUP BY video_id
+           ) rv24 ON rv24.video_id = v.video_id
+           LEFT JOIN (
+               SELECT video_id, COUNT(*) AS week_views
+               FROM views WHERE created_at > ?
+               GROUP BY video_id
+           ) rv7d ON rv7d.video_id = v.video_id
+           LEFT JOIN (
+               SELECT video_id, COUNT(*) AS recent_likes
+               FROM votes WHERE created_at > ? AND vote = 1
+               GROUP BY video_id
+           ) rl ON rl.video_id = v.video_id
+           WHERE v.is_removed = 0 
+             AND COALESCE(a.is_banned, 0) = 0
+             AND v.created_at > ?
+             AND v.views > 0
+             {category_filter}
+           ORDER BY (
+               COALESCE(rv24.recent_views, 0) * 1.0 / (v.views + 1)
+               + COALESCE(rl.recent_likes, 0) * 1.0 / (v.likes + 1)
+               + CASE WHEN v.created_at > ? THEN 2 ELSE 0 END
+           ) DESC, v.created_at DESC
+           LIMIT ?""",
+        (
+            cutoff_24h,
+            cutoff_7d,
+            cutoff_24h,
+            cutoff_7d,
+            cutoff_6h,
+            limit * 2,
+        ) + tuple(category_param),
+    ).fetchall()
+    return rows[:limit]
+
+
 @app.route("/api/trending")
 def trending():
-    """Get trending videos (weighted by recent views, likes, comments, recency)."""
+    """Get trending videos (weighted by recent views, likes, comments, recency).
+    
+    Issue #425: Added category filter support.
+    
+    Query parameters:
+        category - optional category ID filter
+        limit - max results (default 20, max 50)
+    """
     db = get_db()
-    rows = _get_trending_videos(db, limit=20)
+    category = request.args.get("category", "").strip() or None
+    limit = min(50, max(1, request.args.get("limit", 20, type=int)))
+    
+    rows = _get_trending_videos(db, limit=limit, category=category)
 
     videos = []
     for row in rows:
@@ -7922,6 +8306,37 @@ def trending():
         d["avatar_url"] = row["avatar_url"]
         d["recent_views"] = row["recent_views"]
         d["recent_comments"] = row["recent_comments"]
+        videos.append(d)
+
+    return jsonify({"videos": videos})
+
+
+@app.route("/api/trending/rising")
+def trending_rising():
+    """Get rising videos with high engagement velocity (issue #425).
+    
+    Rising videos are those with accelerating engagement relative to their age.
+    Great for discovering emerging content before it hits trending.
+    
+    Query parameters:
+        category - optional category ID filter
+        limit - max results (default 10, max 30)
+    """
+    db = get_db()
+    category = request.args.get("category", "").strip() or None
+    limit = min(30, max(1, request.args.get("limit", 10, type=int)))
+    
+    rows = _get_rising_videos(db, limit=limit, category=category)
+
+    videos = []
+    for row in rows:
+        d = video_to_dict(row)
+        d["agent_name"] = row["agent_name"]
+        d["display_name"] = row["display_name"]
+        d["avatar_url"] = row["avatar_url"]
+        d["recent_views"] = row["recent_views"]
+        d["week_views"] = row["week_views"]
+        d["recent_likes"] = row["recent_likes"]
         videos.append(d)
 
     return jsonify({"videos": videos})
@@ -11191,32 +11606,118 @@ def join_page():
 
 @app.route("/search")
 def search_page():
-    """Search results page."""
+    """Search results page (issue #425: Enhanced with filters and suggestions)."""
     q = request.args.get("q", "").strip()
     videos = []
+    total = 0
+    page = 1
+    pages = 0
+    sort = request.args.get("sort", "relevance")
+    selected_categories = request.args.getlist("category")
+    suggestions = []
+    
+    # Build categories map for template
+    categories_map = {c["id"]: {"name": c["name"], "icon": c["icon"]} for c in VIDEO_CATEGORIES}
 
     if q:
         db = get_db()
         like_q = f"%{q}%"
+        
+        # Get suggestions from search API
+        try:
+            # Fetch suggestions for related searches
+            sug_rows = db.execute(
+                """SELECT DISTINCT title FROM videos 
+                   WHERE is_removed = 0 AND title LIKE ?
+                   ORDER BY views DESC
+                   LIMIT 8""",
+                (f"%{q}%",)
+            ).fetchall()
+            suggestions = [row[0] for row in sug_rows]
+        except:
+            pass
+        
+        # Build WHERE clause with filters
+        conditions = [
+            "v.is_removed = 0",
+            "COALESCE(a.is_banned, 0) = 0",
+            "(v.title LIKE ? OR v.description LIKE ? OR v.tags LIKE ? OR a.agent_name LIKE ?)",
+        ]
+        params = [like_q, like_q, like_q, like_q]
+        
+        # Category filter
+        if selected_categories:
+            cat_placeholders = ",".join("?" for _ in selected_categories)
+            conditions.append(f"v.category IN ({cat_placeholders})")
+            params.extend(selected_categories)
+        
+        # Sort order
+        order_clause = {
+            "relevance": "v.views DESC, v.created_at DESC",
+            "views": "v.views DESC, v.created_at DESC",
+            "likes": "v.likes DESC, v.created_at DESC",
+            "recent": "v.created_at DESC",
+            "trending": "(v.views + v.likes * 3) DESC, v.created_at DESC",
+        }.get(sort, "v.views DESC, v.created_at DESC")
+        
+        where = " AND ".join(conditions)
+        
+        # Get total count
+        total = db.execute(
+            f"SELECT COUNT(*) FROM videos v JOIN agents a ON v.agent_id = a.id WHERE {where}",
+            params,
+        ).fetchone()[0]
+        
+        # Pagination
+        per_page = 24
+        page = max(1, request.args.get("page", 1, type=int))
+        offset = (page - 1) * per_page
+        pages = (total + per_page - 1) // per_page if total else 0
+        
         videos = db.execute(
-            """SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
+            f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
                FROM videos v JOIN agents a ON v.agent_id = a.id
-               WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
-               AND (v.title LIKE ? OR v.description LIKE ? OR v.tags LIKE ? OR a.agent_name LIKE ?)
-               ORDER BY v.views DESC, v.created_at DESC
-               LIMIT 50""",
-            (like_q, like_q, like_q, like_q),
+               WHERE {where}
+               ORDER BY {order_clause}
+               LIMIT ? OFFSET ?""",
+            params + [per_page, offset],
         ).fetchall()
 
-    return render_template("search.html", query=q, videos=videos)
+    return render_template(
+        "search.html", 
+        query=q, 
+        videos=videos,
+        total=total,
+        page=page,
+        pages=pages,
+        sort=sort,
+        selected_categories=selected_categories,
+        categories=VIDEO_CATEGORIES,
+        categories_map=categories_map,
+        suggestions=suggestions,
+    )
 
 
 @app.route("/trending")
 def trending_page():
-    """Dedicated trending page with top 50 videos."""
+    """Dedicated trending page with top 50 videos (issue #425: + rising section, category filter)."""
     db = get_db()
-    rows = _get_trending_videos(db, limit=50)
-    return render_template("trending.html", videos=rows)
+    category = request.args.get("category", "").strip() or None
+    
+    rows = _get_trending_videos(db, limit=50, category=category)
+    
+    # Get rising videos (only show on main trending page, not category-filtered)
+    rising_videos = []
+    if not category:
+        rising_videos = _get_rising_videos(db, limit=10)
+    
+    return render_template(
+        "trending.html", 
+        videos=rows,
+        rising_videos=rising_videos,
+        current_category=category,
+        categories=VIDEO_CATEGORIES,
+    )
 
 
 @app.route("/categories")
