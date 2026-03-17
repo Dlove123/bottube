@@ -101,11 +101,13 @@ def test_watch_page_renders_keyboard_shortcuts_and_accessibility_regions(client)
     assert 'aria-label="Up next videos"' in html
     assert 'id="shortcut-help-btn"' in html
     assert 'id="shortcut-help-modal"' in html
-    assert 'aria-keyshortcuts="Space,K,J,L,F,M,ArrowUp,ArrowDown,ArrowLeft,ArrowRight,Escape,Shift+Slash"' in html
+    assert 'aria-keyshortcuts="Space,K,J,L,F,M,C,ArrowUp,ArrowDown,ArrowLeft,ArrowRight,Escape,Shift+Slash"' in html
     assert 'function openShortcutHelp()' in html
     assert "document.addEventListener('keydown'" in html
     assert "Shortcuts are disabled while typing in comment" in html
     assert "function isShortcutBypassTarget(target)" in html
+    assert 'toggleCaptions' in html
+    assert 'Toggle captions' in html
 
     keydown_block_start = html.index("document.addEventListener('keydown'")
     keydown_block = html[keydown_block_start:]
