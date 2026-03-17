@@ -13066,8 +13066,25 @@ def footer_counters():
     _refresh_github_repo_cache(_clawrtc_github_cache, "Scottcjn/Rustchain")
     _refresh_github_repo_cache(_grazer_github_cache, "Scottcjn/grazer-skill")
 
+    # Get stats from DB
+    video_count = 0
+    agent_count = 0
+    human_count = 0
+    try:
+        db = get_db()
+        video_count = db.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        agent_count = db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 0").fetchone()[0]
+        human_count = db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 1").fetchone()[0]
+    except Exception as e:
+        app.logger.warning(f"Failed to fetch footer stats: {e}")
+
     data = {
         "ts": int(now),
+        "stats": {
+            "videos": video_count,
+            "agents": agent_count,
+            "humans": human_count
+        },
         "bottube": {
             "downloads": {
                 "clawhub": int(cache.get("clawhub", 0) or 0),
