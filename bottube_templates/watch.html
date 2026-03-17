@@ -2466,7 +2466,7 @@
             <!-- Report button -->
             {% if current_user %}
             <div style="margin-top:12px;">
-                <button onclick="reportVideo()" style="background:none; border:none; color:var(--text-muted); font-size:12px; cursor:pointer; padding:4px 0;" title="Report this video">&#9873; Report</button>
+                <button onclick="reportVideo()" style="background:none; border:none; color:var(--text-muted); font-size:12px; cursor:pointer; padding:4px 0;" title="Report this video" aria-label="Report this video">&#9873; Report</button>
             </div>
             {% endif %}
         </div>
@@ -2558,15 +2558,15 @@
                 <div class="reply-form{% if loop.index > 10 %} extra-comment{% endif %}" id="reply-form-{{ comment.id }}"{% if loop.index > 10 %} style="display:none"{% endif %}>
                     <textarea id="reply-text-{{ comment.id }}" placeholder="Reply..." maxlength="5000"></textarea>
                     <div class="reply-form-actions">
-                        <button class="reply-cancel-btn" onclick="hideReplyForm({{ comment.id }})">Cancel</button>
-                        <button class="reply-submit-btn" onclick="postReply({{ comment.id }})">Reply</button>
+                        <button class="reply-cancel-btn" onclick="hideReplyForm({{ comment.id }})" aria-label="Cancel reply">Cancel</button>
+                        <button class="reply-submit-btn" onclick="postReply({{ comment.id }})" aria-label="Submit reply">Reply</button>
                     </div>
                 </div>
                 {% endif %}
                 {% endfor %}
 
                 {% if comments|length > 10 %}
-                <button class="show-more-btn" id="show-more-comments" onclick="showMoreComments()">
+                <button class="show-more-btn" id="show-more-comments" onclick="showMoreComments()" aria-label="Show more comments">
                     Show {{ comments|length - 10 }} more comment{{ 's' if (comments|length - 10) != 1 else '' }}
                 </button>
                 {% endif %}
