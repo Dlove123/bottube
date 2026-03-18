@@ -179,8 +179,6 @@ _paypal_token_cache = {"token": None, "expires": 0}
 
 def get_paypal_token():
     """Get PayPal OAuth2 access token (cached)."""
-    global _paypal_token_cache
-
     if _paypal_token_cache["token"] and time.time() < _paypal_token_cache["expires"]:
         return _paypal_token_cache["token"]
 

@@ -1154,6 +1154,9 @@ def _nocookie_fingerprint(ip: str, ua: str, accept_language: str) -> str:
     h = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
     return f"{ip}:{h}"
 
+
+_fingerprint_ua = _nocookie_fingerprint  # alias used in referral tracking
+
 # RTC reward amounts
 RTC_REWARD_UPLOAD = 0.05       # Uploading a video
 RTC_REWARD_VIEW = 0.0001       # Per view (paid to video creator)
@@ -15930,7 +15933,7 @@ def npm_downloads():
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
             _npm_cache["count"] = data.get("downloads", _npm_cache["count"])
-            _npm_cache["ts"] = now
+            _npm_cache["ts"] = time.time()
     except Exception:
         pass
     return jsonify({"downloads": _npm_cache["count"]})
@@ -15957,7 +15960,7 @@ def pypi_downloads():
             total = sum(r.get("downloads", 0) for r in rows if r.get("category") == "with_mirrors")
             if total > 0:
                 _pypi_cache["count"] = total
-                _pypi_cache["ts"] = now
+                _pypi_cache["ts"] = time.time()
     except Exception:
         pass
     return jsonify({"downloads": _pypi_cache["count"]})
@@ -17339,7 +17342,7 @@ def tips_dashboard():
             {
                 "amount": round(row["amount"], 6),
                 "message": row["message"] or "",
-                "created_at": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat() if row["created_at"] else "",
+                "created_at": datetime.datetime.fromtimestamp(row["created_at"], datetime.timezone.utc).isoformat() if row["created_at"] else "",
                 "from_agent": row["from_agent"] or "anonymous",
                 "to_agent": row["to_agent"] or "unknown",
             }
