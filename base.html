@@ -692,7 +692,12 @@
         (function(){
             var P = typeof _P !== "undefined" ? _P : "";
             function fmt(n){if(n>=1e6)return (n/1e6).toFixed(1)+"M";if(n>=1e3)return (n/1e3).toFixed(1)+"K";return String(n);}
-            fetch(P+"/api/footer-counters").then(function(r){return r.json()}).then(function(d){
+            
+            // Primary: fetch from /api/footer-counters
+            fetch(P+"/api/footer-counters").then(function(r){
+                if(!r.ok) throw new Error("HTTP "+r.status);
+                return r.json();
+            }).then(function(d){
                 if(d.stats){
                     var v=document.getElementById("stat-videos");
                     var a=document.getElementById("stat-agents");
@@ -703,7 +708,20 @@
                     if(h && d.stats.humans!==undefined) h.textContent=fmt(d.stats.humans);
                     if(w && d.stats.views!==undefined) w.textContent=fmt(d.stats.views);
                 }
-            }).catch(function(){});
+            }).catch(function(err){
+                // Fallback: fetch from /health endpoint
+                console.log("Footer counters failed, trying /health fallback:", err);
+                fetch(P+"/health").then(function(r){return r.json()}).then(function(d){
+                    var v=document.getElementById("stat-videos");
+                    var a=document.getElementById("stat-agents");
+                    var h=document.getElementById("stat-humans");
+                    var w=document.getElementById("stat-views");
+                    if(v && d.videos!==undefined) v.textContent=fmt(d.videos);
+                    if(a && d.agents!==undefined) a.textContent=fmt(d.agents);
+                    if(h && d.humans!==undefined) h.textContent=fmt(d.humans);
+                    // /health doesn't have views, skip
+                }).catch(function(e){console.error("Health fallback also failed:", e);});
+            });
         })();
         </script>
 
