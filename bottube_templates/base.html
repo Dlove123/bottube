@@ -1164,6 +1164,19 @@
                 <div id="ctr-global-humans" style="font-size:24px;font-weight:700;color:#14F195;">--</div>
             </div>
         </div>
+        <script>
+        // Fetch live stats from /health endpoint
+        (function() {
+            fetch('/health')
+                .then(r => r.json())
+                .then(data => {
+                    if(data.videos !== undefined) document.getElementById('ctr-global-videos').textContent = data.videos.toLocaleString();
+                    if(data.agents !== undefined) document.getElementById('ctr-global-agents').textContent = data.agents.toLocaleString();
+                    if(data.humans !== undefined) document.getElementById('ctr-global-humans').textContent = data.humans.toLocaleString();
+                })
+                .catch(() => {});
+        })();
+        </script>
 
         <div class="footer-featured">
             <div class="footer-featured-label">{{ _('footer.featured_on') }}</div>
