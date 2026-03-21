@@ -8,8 +8,9 @@ import sqlite3
 import json
 import csv
 import io
+from pathlib import Path
 from datetime import datetime, timedelta
-from flask import Blueprint, render_template, jsonify, request, g, Response
+from flask import Blueprint, render_template, jsonify, request, g, Response, session
 from functools import wraps
 
 analytics_bp = Blueprint('analytics', __name__, url_prefix='/analytics')
