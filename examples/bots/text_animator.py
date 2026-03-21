@@ -1,16 +1,87 @@
-import os, sys, random, subprocess, time, json
+#!/usr/bin/env python3
+"""
+Animated text/quote video generator bot.
+
+This example script renders a sequence of quote images, stitches them into
+a video using ffmpeg, and (optionally) uploads the result using BotTube API.
+Bots in this repo are meant to serve as runnable examples.
+
+Requirements:
+- Python 3.8+
+- Pillow (PIL) installed, e.g.: `pip install pillow`
+- ffmpeg installed and on your PATH
+
+Configuration:
+- BotTube API Key:
+  * Environment variable: BOTTUBE_API_KEY
+    (preferred; avoids hardcoding secrets).
+- Output Directory:
+  * Controlled by OUTPUT_DIR constant below.
+  * Defaults to an ephemeral temp directory if TEXT_ANIMATOR_OUTPUT_DIR is unset.
+
+Usage Example:
+- From repo root:
+  $ export BOTTUBE_API_KEY="your_api_key_here"
+  $ python examples/bots/text_animator.py
+
+Or marked executable and run directly:
+  $ chmod +x examples/bots/text_animator.py
+  $ ./examples/bots/text_animator.py
+
+Safety & Operational Notes:
+- This script writes image/video files into OUTPUT_DIR.
+- It may make outbound HTTP requests to fetch quotes and upload media.
+- Review generated content and your API key config before
+  putting it to production or sharing generated videos.
+"""
+
+import os
+import sys
+import random
+import subprocess
+import json
+import tempfile
 import urllib.request
 from PIL import Image, ImageDraw, ImageFont
 
-API_KEY = "bottube_sk_dc1a24fb97664272f3fd0b0cf454098be5a9d34247fdaf01"
-OUTPUT_DIR = "/tmp/text_animator/output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+API_KEY = os.getenv("BOTTUBE_API_KEY")
+if not API_KEY:
+    print("Error: BoTTube API key is not set. Please set the BOTTUBE_API_KEY environment variable.", file=sys.stderr)
+    sys.exit(1)
 
-FONTS = [
+OUTPUT_DIR = os.environ.get("TEXT_ANIMATOR_OUTPUT_DIR")
+if OUTPUT_DIR:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+else:
+    OUTPUT_DIR = tempfile.mkdtemp(prefix="text_animator_")
+
+FONT_DIR = os.environ.get(
+    "TEXT_ANIMATOR_FONT_DIR",
+    os.path.join(os.path.dirname(__file__), "fonts"),
+)
+
+_FONT_BASENAMES = [
     "Oswald-Bold.ttf",
     "Lora-Bold.ttf",
-    "PTSans-Bold.ttf"
+    "PTSans-Bold.ttf",
 ]
+
+_resolved_fonts = []
+for _name in _FONT_BASENAMES:
+    _candidate = os.path.join(FONT_DIR, _name)
+    if os.path.isfile(_candidate):
+        _resolved_fonts.append(_candidate)
+    else:
+        _resolved_fonts.append(_name)
+
+if any(not os.path.isfile(os.path.join(FONT_DIR, n)) for n in _FONT_BASENAMES):
+    print(
+        f"[text_animator] Warning: Custom fonts not found in '{FONT_DIR}'. "
+        "Pillow will likely fall back to default fonts.",
+        file=sys.stderr,
+    )
+
+FONTS = _resolved_fonts
 
 FALLBACK_QUOTES = [
     {"q": "Talk is cheap. Show me the code.", "a": "Linus Torvalds"},
@@ -53,47 +124,28 @@ FALLBACK_QUOTES = [
 def fetch_dynamic_quotes(count=36):
     quotes = []
     try:
-        req = urllib.request.Request("https://dummyjson.com/quotes?limit=50", headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-            for item in data.get('quotes', []):
-                quotes.append({"q": item["quote"], "a": item["author"]})
+        req = urllib.request.Request("https://dummyjson.com/quotes?limit=100", headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            quotes = [{"q": item['quote'], "a": item['author']} for item in data.get('quotes', [])]
     except Exception as e:
-        print("Dynamic fetch failed, using fallback:", e)
-    
-    if len(quotes) < count:
-        quotes.extend(FALLBACK_QUOTES)
+        print(f"Could not fetch dynamic quotes: {e}")
+        
+    if not quotes:
+        quotes = FALLBACK_QUOTES
         
     random.shuffle(quotes)
+    while len(quotes) < count:
+        quotes.extend(quotes)
+        
     return quotes[:count]
-
-def wrap_text(text, font, max_width, draw):
-    words = text.split()
-    lines = []
-    curr_line = []
-    for word in words:
-        test_line = ' '.join(curr_line + [word])
-        # get length
-        bbox = draw.textbbox((0, 0), test_line, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            curr_line.append(word)
-        else:
-            if curr_line:
-                lines.append(' '.join(curr_line))
-            curr_line = [word]
-    if curr_line:
-        lines.append(' '.join(curr_line))
-    return lines
 
 def create_gradient_bg(width, height, color1, color2):
     base = Image.new('RGB', (width, height), color1)
     top = Image.new('RGB', (width, height), color2)
-    mask = Image.new('L', (width, height))
-    mask_data = []
-    for y in range(height):
-        for x in range(width):
-            mask_data.append(int(255 * (y / height)))
-    mask.putdata(mask_data)
+    # Using PIL native gradient to avoid building large masks in Python.
+    # Image.linear_gradient("L") creates a horizontal gradient; rotate it to make it vertical.
+    mask = Image.linear_gradient("L").rotate(90, expand=True).resize((width, height))
     base.paste(top, (0, 0), mask)
     return base
 
@@ -103,7 +155,6 @@ def render_movie(quote, author, style, font_path, out_file):
     DURATION = 5.0
     TOTAL_FRAMES = int(FPS * DURATION)
     
-    # Palette
     c1 = (random.randint(10, 50), random.randint(10, 50), random.randint(20, 80))
     c2 = (random.randint(20, 60), random.randint(20, 60), random.randint(40, 100))
     bg = create_gradient_bg(W, H, c1, c2)
@@ -112,114 +163,144 @@ def render_movie(quote, author, style, font_path, out_file):
     try:
         font = ImageFont.truetype(font_path, font_size)
         font_author = ImageFont.truetype(font_path, 32)
-    except:
+    except OSError as e:
+        print(f"Failed to load font '{font_path}': {e}. Falling back to default.")
         font = ImageFont.load_default()
-        font_author = font
+        font_author = ImageFont.load_default()
+        font_size = 12
+
+    def wrap_text(text, font, max_width):
+        words = text.split()
+        lines = []
+        current_line = []
+        for word in words:
+            current_line.append(word)
+            bbox = font.getbbox(" ".join(current_line))
+            w = bbox[2] - bbox[0]
+            if w > max_width:
+                current_line.pop()
+                lines.append(" ".join(current_line))
+                current_line = [word]
+        if current_line:
+            lines.append(" ".join(current_line))
+        return lines
         
-    draw = ImageDraw.Draw(bg)
-    lines = wrap_text(f'"{quote}"', font, W - 100, draw)
+    lines = wrap_text(quote, font, W - 80)
     
-    # Calculate text block height
-    line_h = 60
-    total_text_h = len(lines) * line_h + 40
-    start_y = (H - total_text_h) // 2 - 30
+    text_tot_h = 0
+    line_heights = []
+    for line in lines:
+        bbox = font.getbbox(line)
+        h = bbox[3] - bbox[1]
+        line_heights.append(h)
+        text_tot_h += h + 10
+        
+    author_bbox = font_author.getbbox(f"- {author}")
+    author_w = author_bbox[2] - author_bbox[0]
+    author_h = author_bbox[3] - author_bbox[1]
     
-    author_text = f"— {author}"
+    total_content_height = text_tot_h + 40 + author_h
+    start_y = (H - total_content_height) // 2
     
+    frames = []
+    for f_idx in range(TOTAL_FRAMES):
+        frame = bg.copy()
+        draw = ImageDraw.Draw(frame)
+        
+        progress = f_idx / TOTAL_FRAMES
+        
+        if style == "slide_up":
+            offset_y = int(50 * (1 - progress))
+            alpha = int(255 * min(1.0, progress * 3))
+        elif style == "fade_words":
+            offset_y = 0
+            alpha = 255
+        elif style == "typewriter":
+            offset_y = 0
+            alpha = 255
+        else:
+            offset_y = 0
+            alpha = 255
+            
+        y = start_y + offset_y
+        
+        if style == "typewriter":
+            total_chars = sum(len(l) for l in lines)
+            chars_to_show = int(total_chars * progress * 2) 
+            chars_counted = 0
+            for i, line in enumerate(lines):
+                if chars_counted >= chars_to_show:
+                    break
+                
+                show_len = chars_to_show - chars_counted
+                display_line = line[:show_len]
+                bbox = font.getbbox(display_line)
+                w = bbox[2] - bbox[0]
+                x = (W - w) // 2
+                draw.text((x, y), display_line, font=font, fill=(255, 255, 255, 255))
+                y += line_heights[i] + 10
+                chars_counted += len(line)
+        else:
+            for i, line in enumerate(lines):
+                bbox = font.getbbox(line)
+                w = bbox[2] - bbox[0]
+                x = (W - w) // 2
+                
+                if style == "fade_words":
+                    line_progress = min(1.0, max(0.0, progress * 2 - i * 0.2))
+                    line_alpha = int(255 * line_progress)
+                    draw.text((x, y), line, font=font, fill=(255, 255, 255, line_alpha))
+                else:
+                    draw.text((x, y), line, font=font, fill=(255, 255, 255, alpha))
+                    
+                y += line_heights[i] + 10
+                
+        if progress > 0.5:
+            author_alpha = int(255 * min(1.0, (progress - 0.5) * 4))
+            ay = y + 40
+            ax = (W - author_w) // 2
+            draw.text((ax, ay), f"- {author}", font=font_author, fill=(200, 200, 200, author_alpha))
+            
+        frames.append(frame)
+
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-f", "image2pipe", "-vcodec", "png", "-r", str(FPS),
         "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-b:v", "500k", "-maxrate", "1M", "-bufsize", "1M",
         "-t", str(DURATION), out_file
     ]
-    p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     
-    for f in range(TOTAL_FRAMES):
-        frame = bg.copy()
-        f_draw = ImageDraw.Draw(frame)
-        time_ratio = f / TOTAL_FRAMES
+    try:
+        for frame in frames:
+            try:
+                frame.save(p.stdin, 'PNG')
+            except BrokenPipeError:
+                break
+    finally:
+        p.stdin.close()
         
-        if style == "typewriter":
-            # Reveal letters
-            total_chars = sum(len(l) for l in lines)
-            chars_to_show = int((f / (TOTAL_FRAMES * 0.7)) * total_chars)
-            chars_to_show = min(chars_to_show, total_chars)
-            
-            y = start_y
-            drawn = 0
-            for line in lines:
-                if drawn >= chars_to_show: break
-                rem = chars_to_show - drawn
-                to_draw = line[:rem]
-                f_draw.text((50, y), to_draw, font=font, fill=(255, 255, 255))
-                drawn += len(to_draw)
-                y += line_h
-                
-            if time_ratio > 0.8:
-                f_draw.text((W - 50 - f_draw.textlength(author_text, font=font_author), y + 20),
-                            author_text, font=font_author, fill=(200, 200, 200))
-                            
-        elif style == "slide_up":
-            # Slide everything up
-            progress = min(1.0, f / (TOTAL_FRAMES * 0.5))
-            # easing easeOutCubic
-            ease = 1 - pow(1 - progress, 3)
-            offset_y = int((1 - ease) * 200)
-            alpha = int(ease * 255)
-            
-            y = start_y + offset_y
-            # we must use RGBA to draw with alpha, but PIL simple text fill doesn't support alpha on RGB nicely 
-            # without an overlay. Let's do a trick: draw white but blend the whole text layer.
-            txt_layer = Image.new('RGBA', (W, H), (0,0,0,0))
-            t_draw = ImageDraw.Draw(txt_layer)
-            for line in lines:
-                t_draw.text((50, y), line, font=font, fill=(255, 255, 255, alpha))
-                y += line_h
-            if time_ratio > 0.3:
-                a_alpha = int(min(1.0, (time_ratio-0.3)*3) * 255)
-                t_draw.text((W - 50 - f_draw.textlength(author_text, font=font_author), y + 20),
-                            author_text, font=font_author, fill=(200, 200, 200, a_alpha))
-            frame.paste(txt_layer, (0,0), txt_layer)
-            
-        elif style == "fade_words":
-            # Fade in words one by one
-            words = sum((l.split() for l in lines), [])
-            total_words = len(words)
-            words_to_show = int((f / (TOTAL_FRAMES * 0.7)) * total_words)
-            words_to_show = min(words_to_show, total_words)
-            
-            y = start_y
-            w_idx = 0
-            for line in lines:
-                x = 50
-                for word in line.split():
-                    if w_idx < words_to_show:
-                        txt_width = f_draw.textlength(word + " ", font=font)
-                        f_draw.text((x, y), word, font=font, fill=(255, 255, 255))
-                        x += txt_width
-                    w_idx += 1
-                y += line_h
-                
-            if time_ratio > 0.8:
-                f_draw.text((W - 50 - f_draw.textlength(author_text, font=font_author), y + 20),
-                            author_text, font=font_author, fill=(200, 200, 200))
-        
-        frame.save(p.stdin, 'PNG')
-        
-    p.stdin.close()
-    p.wait()
+    _, err = p.communicate()
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed with return code {p.returncode}: {err.decode('utf-8', errors='ignore')}")
 
 def upload_video(file_path, idx):
     title = f"Daily Inspiration #{idx}"
     desc = "#quote #inspiration Animated by KineticTypo_Bot_by_Yuzengbao"
     import requests # Fallback to requests for multipart data
-    url = "https://bottube.ai/api/upload"
+    
+    base_url = os.environ.get("BOTTUBE_URL", "https://bottube.ai").rstrip("/")
+    url = f"{base_url}/api/upload"
     headers = {"X-API-Key": API_KEY}
+    
     try:
         with open(file_path, 'rb') as f:
             files = {'video': (os.path.basename(file_path), f, 'video/mp4')}
             data = {'title': title, 'description': desc}
-            r = requests.post(url, headers=headers, files=files, data=data)
-            print(f"Uploaded {file_path}: {r.status_code} {r.text}")
+            r = requests.post(url, headers=headers, files=files, data=data, timeout=30)
+            if 200 <= r.status_code < 300:
+                print(f"Uploaded {file_path}: {r.status_code} {r.text}")
+            else:
+                print(f"Failed to upload {file_path}: HTTP {r.status_code} {r.text}")
     except Exception as e:
         print(f"Upload failed for {file_path}: {e}")
 
@@ -228,23 +309,27 @@ def main():
     styles = ["typewriter", "slide_up", "fade_words"]
     
     videos = []
-    print(f"Loaded {len(quotes)} quotes. Starting rendering...")
+    print(f"Loaded {len(quotes)} quotes. Starting rendering in {OUTPUT_DIR}...")
+    
     for i, q in enumerate(quotes):
-        out_file = os.path.join(OUTPUT_DIR, f"video_{i}.mp4")
-        st = styles[i % len(styles)]
-        ft = FONTS[i % len(FONTS)]
+        out_path = os.path.join(OUTPUT_DIR, f"video_{i}.mp4")
+        style = random.choice(styles)
+        font = random.choice(FONTS)
+        print(f"[{i+1}/{len(quotes)}] Rendering '{q['q'][:20]}...' (Style: {style})")
         
-        print(f"[{i+1}/{len(quotes)}] Rendering {st} with {ft}: {q['q'][:30]}...")
-        render_movie(q['q'], q['a'], st, ft, out_file)
+        try:
+            render_movie(q['q'], q['a'], style, font, out_path)
+            videos.append(out_path)
+        except Exception as e:
+            print(f"Failed to render video {i}: {e}", file=sys.stderr)
+            
+    print(f"Finished generating {len(videos)} videos.")
+    print("Beginning uploads...")
+    
+    for idx, v in enumerate(videos):
+        upload_video(v, idx)
         
-        # Verify size
-        size_kb = os.path.getsize(out_file) / 1024
-        print(f"   -> Done. Size: {size_kb:.1f} KB")
-        videos.append(out_file)
-        
-    print("\nUploading to BoTTube...")
-    for i, v in enumerate(videos):
-        upload_video(v, i+1)
+    print("All tasks completed.")
 
 if __name__ == "__main__":
     main()
