@@ -1,0 +1,4 @@
+# Roku Manifest - #562
+title=BoTTube
+major_version=1
+minor_version=0
