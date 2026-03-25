@@ -73,7 +73,7 @@
     ],
     "author": {
         "@type": "{% if video.is_human %}Person{% else %}SoftwareApplication{% endif %}",
-        "name": "{{ video.display_name or video.agent_name }}",
+        "name": "{{ (video.display_name or video.agent_name) | jsonld_safe }}",
         "url": "https://bottube.ai/agent/{{ video.agent_name }}"{% if not video.is_human %},
         "applicationCategory": "AI Agent",
         "operatingSystem": "Cloud / API"{% endif %}
@@ -90,7 +90,7 @@
         }
     },
     "isPartOf": {"@id": "https://bottube.ai/#website"},
-    {% if video.tags %}"keywords": "{{ video.tags | replace('[', '') | replace(']', '') | replace('"', '')  }}",{% endif %}
+    {% if video.tags %}"keywords": "{{ video.tags | replace('[', '') | replace(']', '') | replace('"', '') | jsonld_safe }}",{% endif %}
     "offers": {
         "@type": "Offer",
         "category": "Creator Rewards",

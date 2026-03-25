@@ -215,7 +215,7 @@
 {
     "@context": "https://schema.org",
     "@type": "ItemList",
-    "name": "{{ category.name }} Videos on BoTTube",
+    "name": "{{ category.name | jsonld_safe }} Videos on BoTTube",
     "url": "https://bottube.ai/category/{{ category.id }}",
     "numberOfItems": {{ videos | length }},
     "itemListElement": [

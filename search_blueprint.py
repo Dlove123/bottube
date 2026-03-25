@@ -307,13 +307,13 @@ def api_trending():
             FROM views 
             WHERE created_at >= ? 
             GROUP BY video_id
-        ) vc ON vc.video_id = v.id
+        ) vc ON vc.video_id = v.video_id
         LEFT JOIN (
-            SELECT video_id, COUNT(*) as recent_comments 
-            FROM comments 
-            WHERE created_at >= ? 
+            SELECT video_id, COUNT(*) as recent_comments
+            FROM comments
+            WHERE created_at >= ?
             GROUP BY video_id
-        ) cc ON cc.video_id = v.id
+        ) cc ON cc.video_id = v.video_id
         WHERE trending_score > 0
         ORDER BY trending_score DESC
         LIMIT ?""", (day_ago, day_ago, limit)).fetchall()
@@ -343,21 +343,32 @@ def api_trending():
 def api_for_you():
     """
     Personalized "For You" feed based on viewing history.
-    Requires agent_id parameter for personalization.
+    Authenticate via X-API-Key header to get personalized results.
+    Falls back to trending if no key provided.
     """
-    agent_id = request.args.get('agent_id')
     limit = min(int(request.args.get('limit', 20)), 50)
-    
+
+    # Authenticate agent via API key header (not raw agent_id param)
+    api_key = request.headers.get('X-API-Key', '').strip()
+    agent_id = None
+    if api_key:
+        db_check = get_db()
+        agent_row = db_check.execute(
+            "SELECT id FROM agents WHERE api_key = ?", (api_key,)
+        ).fetchone()
+        if agent_row:
+            agent_id = agent_row['id']
+
     if not agent_id:
-        # Return popular videos if no agent_id
+        # Return popular videos if not authenticated
         return api_trending()
     
     db = get_db()
     
     # Get categories and tags the agent has viewed
-    viewed = db.execute("""SELECT DISTINCT v.category, v.tags 
+    viewed = db.execute("""SELECT DISTINCT v.category, v.tags
         FROM views vw
-        JOIN videos v ON vw.video_id = v.id
+        JOIN videos v ON vw.video_id = v.video_id
         WHERE vw.agent_id = ?""", (agent_id,)).fetchall()
     
     categories = set()
@@ -375,41 +386,47 @@ def api_for_you():
         # New user - return trending
         return api_trending()
     
-    # Build recommendation query
-    category_scores = []
-    for cat in categories:
-        category_scores.append(f"CASE WHEN v.category = '{cat}' THEN 3 ELSE 0 END")
-    
+    # Build recommendation query using parameterized SQL
+    # Each CASE uses a parameter placeholder instead of string interpolation
     score_parts = []
-    if category_scores:
-        score_parts.append(" + ".join(category_scores))
-    
-    # Tag matching
-    for tag in list(tags)[:10]:  # Limit to top 10 tags
-        score_parts.append(f"CASE WHEN LOWER(v.tags) LIKE '%\"{tag}\"%' THEN 2 ELSE 0 END")
-    
-    # Recency score
+    params = []
+
+    for cat in categories:
+        score_parts.append("CASE WHEN v.category = ? THEN 3 ELSE 0 END")
+        params.append(cat)
+
+    # Tag matching (parameterized LIKE)
+    for tag in list(tags)[:10]:
+        score_parts.append("CASE WHEN LOWER(v.tags) LIKE ? THEN 2 ELSE 0 END")
+        params.append(f'%"{tag}"%')
+
+    # Recency score (parameterized timestamp)
     week_ago = (datetime.now() - timedelta(days=7)).timestamp()
-    score_parts.append(f"CASE WHEN v.created_at >= {week_ago} THEN 5 ELSE 0 END")
-    
-    # General popularity
+    score_parts.append("CASE WHEN v.created_at >= ? THEN 5 ELSE 0 END")
+    params.append(week_ago)
+
+    # General popularity (no user input, safe as-is)
     score_parts.append("v.views * 0.001")
     score_parts.append("v.likes * 0.01")
-    
-    score_sql = " + ".join(score_parts)
-    
-    # Exclude already viewed
+
+    score_sql = " + ".join(score_parts) if score_parts else "0"
+
+    # Exclude already viewed (parameterized)
     viewed_ids = db.execute(
         "SELECT DISTINCT video_id FROM views WHERE agent_id = ?",
         (agent_id,)
     ).fetchall()
-    viewed_list = [f"'{v[0]}'" for v in viewed_ids]
-    
+    viewed_id_list = [v[0] for v in viewed_ids]
+
     exclude_sql = ""
-    if viewed_list:
-        exclude_sql = f"AND v.video_id NOT IN ({', '.join(viewed_list)})"
-    
-    sql = f"""SELECT 
+    if viewed_id_list:
+        placeholders = ", ".join("?" for _ in viewed_id_list)
+        exclude_sql = f"AND v.video_id NOT IN ({placeholders})"
+        params.extend(viewed_id_list)
+
+    params.append(limit)
+
+    sql = f"""SELECT
             v.id,
             v.video_id,
             v.title,
@@ -429,8 +446,8 @@ def api_for_you():
         WHERE 1=1 {exclude_sql}
         ORDER BY recommendation_score DESC
         LIMIT ?"""
-    
-    results = db.execute(sql, (limit,)).fetchall()
+
+    results = db.execute(sql, params).fetchall()
     
     videos = []
     for row in results:
