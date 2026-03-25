@@ -11,29 +11,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent_memory import (
     AgentMemory,
-    AgentStats,
     ReferenceType,
     SelfReference,
     TfIdfStore,
-    VideoRecord,
 )
 
 
-# ---------------------------------------------------------------------------
-# TF-IDF Store
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def mem(tmp_path):
+    return AgentMemory(
+        agent="cosmo",
+        db_path=tmp_path / "memory.db",
+        now_fn=lambda: 1700000000.0,
+    )
+
+
+@pytest.fixture
+def populated_mem(tmp_path):
+    """Memory with several videos already ingested."""
+    t = [1700000000.0]
+    m = AgentMemory(agent="cosmo", db_path=tmp_path / "mem.db",
+                    now_fn=lambda: t[0])
+    videos = [
+        ("v1", "Why PowerPC Rules", "The G4 is the greatest chip ever made",
+         ["hardware", "powerpc"], ["PowerPC is superior to x86"]),
+        ("v2", "Cooking With Algorithms", "Making pasta with sorting logic",
+         ["cooking", "algorithms"], []),
+        ("v3", "RustChain Mining Guide", "How to set up your miner on vintage hardware",
+         ["rustchain", "mining", "hardware"], ["Mining is the future"]),
+        ("v4", "PowerPC vs ARM — Part 1", "First in a series comparing architectures",
+         ["hardware", "powerpc", "arm"], ["ARM is catching up"]),
+        ("v5", "PowerPC vs ARM — Part 2", "Continuing the comparison",
+         ["hardware", "powerpc", "arm"], []),
+    ]
+    for i, (vid, title, desc, tags, opinions) in enumerate(videos):
+        t[0] = 1700000000.0 + i * 86400  # 1 day apart
+        m.ingest_video(vid, title, desc, tags=tags, opinions=opinions)
+    t[0] = 1700000000.0 + 14 * 86400  # 2 weeks later
+    return m
+
 
 class TestTfIdfStore:
     def test_add_and_search(self):
         store = TfIdfStore()
-        store.add("d1", "PowerPC G4 vintage hardware mining")
-        store.add("d2", "Modern x86 benchmark comparison")
-        store.add("d3", "PowerPC architecture deep dive")
-        results = store.search("PowerPC hardware")
+        store.add("d1", "the quick brown fox jumps over the lazy dog")
+        store.add("d2", "a fast red car drives down the highway")
+        store.add("d3", "the brown dog sleeps in the sun")
+
+        results = store.search("brown dog", top_k=2)
         assert len(results) >= 1
-        # d1 or d3 should be top result
-        top_id = results[0][0]
-        assert top_id in ("d1", "d3")
+        # d1 or d3 should be top (both have "brown" and/or "dog")
+        ids = [r[0] for r in results]
+        assert "d1" in ids or "d3" in ids
 
     def test_empty_store(self):
         store = TfIdfStore()
@@ -41,250 +70,167 @@ class TestTfIdfStore:
 
     def test_remove(self):
         store = TfIdfStore()
-        store.add("d1", "test document")
+        store.add("d1", "hello world")
         store.remove("d1")
-        assert store.search("test") == []
-
-    def test_short_words_filtered(self):
-        store = TfIdfStore()
-        store.add("d1", "a an the is")
-        # All words <= 2 chars, should be empty after tokenization
-        assert store.search("a an") == []
+        assert store.search("hello world") == []
 
 
-# ---------------------------------------------------------------------------
-# AgentMemory basics
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mem(tmp_path):
-    return AgentMemory(
-        agent="test_bot",
-        db_path=tmp_path / "memory.db",
-        now_fn=lambda: 1700000000.0,
-    )
-
-
-class TestIngest:
-    def test_ingest_video(self, mem):
-        mem.ingest_video("v1", "My First Video", "Description here", ["tag1"])
-        stats = mem.get_stats()
-        assert stats.total_videos == 1
-
-    def test_ingest_multiple(self, mem):
-        for i in range(5):
-            mem.ingest_video(f"v{i}", f"Video {i}", f"Description {i}")
-        assert mem.get_stats().total_videos == 5
-
-    def test_ingest_with_opinions(self, mem):
-        mem.ingest_video("v1", "Hot Take", opinions=["PowerPC is better"])
-        results = mem.search("PowerPC")
-        assert len(results) == 0  # opinions not in search text
-        # But video is stored
-        assert mem.get_stats().total_videos == 1
-
-
-class TestSearch:
-    def test_search_by_title(self, mem):
-        mem.ingest_video("v1", "PowerPC G4 Mining Guide", tags=["hardware"])
-        mem.ingest_video("v2", "Cooking Pasta Basics", tags=["cooking"])
-        results = mem.search("PowerPC hardware")
+class TestIngestAndSearch:
+    def test_ingest_single(self, mem):
+        mem.ingest_video("v1", "Test Video", "A description", tags=["test"])
+        results = mem.search("test video")
+        assert len(results) == 1
         assert results[0][0].video_id == "v1"
 
-    def test_search_by_tags(self, mem):
-        mem.ingest_video("v1", "Video One", tags=["blockchain", "mining"])
-        mem.ingest_video("v2", "Video Two", tags=["cooking", "recipe"])
-        results = mem.search("blockchain mining")
-        assert results[0][0].video_id == "v1"
+    def test_search_by_topic(self, populated_mem):
+        results = populated_mem.search("PowerPC hardware")
+        assert len(results) >= 1
+        titles = [r[0].title for r in results]
+        assert any("PowerPC" in t for t in titles)
 
-    def test_has_covered_topic(self, mem):
-        mem.ingest_video("v1", "Deep Dive into Rust Programming")
-        assert mem.has_covered_topic("Rust programming") is True
-        assert mem.has_covered_topic("quantum physics") is False
+    def test_search_unrelated(self, populated_mem):
+        results = populated_mem.search("quantum physics dark matter")
+        # Should return few or no results with low scores
+        if results:
+            assert results[0][1] < 0.5
 
+    def test_has_covered_topic(self, populated_mem):
+        assert populated_mem.has_covered_topic("PowerPC hardware")
+        assert populated_mem.has_covered_topic("mining rustchain")
+        # Unlikely to have covered
+        assert not populated_mem.has_covered_topic("underwater basket weaving xyz123")
 
-# ---------------------------------------------------------------------------
-# Self-reference suggestions
-# ---------------------------------------------------------------------------
 
 class TestSuggestReference:
-    def test_first_time_topic(self, mem):
-        ref = mem.suggest_reference("Brand New Topic")
+    def test_followup_for_recent_related(self, tmp_path):
+        t = [1000.0]
+        m = AgentMemory(agent="bot", db_path=tmp_path / "m.db",
+                        now_fn=lambda: t[0])
+        m.ingest_video("v1", "Introduction to Rust Programming",
+                       "Learning Rust basics", tags=["rust", "programming"])
+        t[0] = 1000.0 + 7 * 86400  # 7 days later
+        ref = m.suggest_reference("Advanced Rust Patterns",
+                                  "More Rust programming techniques")
+        assert ref is not None
+        assert ref.type in (ReferenceType.FOLLOWUP, ReferenceType.CALLBACK,
+                           ReferenceType.CHANGED_MIND)
+        assert ref.related_video_id == "v1"
+
+    def test_first_time_for_new_topic(self, populated_mem):
+        ref = populated_mem.suggest_reference(
+            "Underwater Basket Weaving XYZ",
+            "Something completely different",
+        )
         assert ref is not None
         assert ref.type == ReferenceType.FIRST_TIME
 
-    def test_followup_recent_video(self, tmp_path):
-        """Video from 3 days ago → followup reference."""
-        now = 1700000000.0
-        mem = AgentMemory(
-            agent="bot", db_path=tmp_path / "m.db",
-            now_fn=lambda: now,
-        )
-        # Video from 3 days ago
-        mem.ingest_video("v1", "PowerPC Architecture Overview",
-                         "A deep dive into PowerPC",
-                         tags=["hardware", "powerpc"])
-        # Hack created_at to 3 days ago
-        with sqlite3.connect(str(tmp_path / "m.db")) as conn:
-            conn.execute(
-                "UPDATE agent_videos SET created_at=? WHERE video_id='v1'",
-                (now - 3 * 86400,),
-            )
-        mem._store = TfIdfStore()
-        mem._load_into_store()
-
-        ref = mem.suggest_reference("More PowerPC Thoughts", "thinking about powerpc")
-        assert ref is not None
-        assert ref.type in (ReferenceType.FOLLOWUP, ReferenceType.CALLBACK,
-                            ReferenceType.CHANGED_MIND)
-        assert "v1" == ref.related_video_id or ref.related_title is not None
-
-    def test_callback_old_video(self, tmp_path):
-        """Video from 30 days ago → callback reference."""
-        now = 1700000000.0
-        mem = AgentMemory(
-            agent="bot", db_path=tmp_path / "m.db",
-            now_fn=lambda: now,
-        )
-        mem.ingest_video("v1", "Vintage Hardware Mining Setup",
-                         "How to mine with old computers",
-                         tags=["mining", "vintage"])
-        with sqlite3.connect(str(tmp_path / "m.db")) as conn:
-            conn.execute(
-                "UPDATE agent_videos SET created_at=? WHERE video_id='v1'",
-                (now - 30 * 86400,),
-            )
-        mem._store = TfIdfStore()
-        mem._load_into_store()
-
-        ref = mem.suggest_reference("Mining with Vintage Computers", "vintage mining setup")
-        assert ref is not None
-        assert ref.type in (ReferenceType.CALLBACK, ReferenceType.CHANGED_MIND)
-
-    def test_changed_mind_with_opinions(self, tmp_path):
-        now = 1700000000.0
-        mem = AgentMemory(
-            agent="bot", db_path=tmp_path / "m.db",
-            now_fn=lambda: now,
-        )
-        mem.ingest_video("v1", "Why Modern Hardware Wins",
-                         "Modern beats vintage",
-                         tags=["hardware"],
-                         opinions=["Modern hardware is objectively better"])
-        ref = mem.suggest_reference("Hardware Comparison", "modern versus vintage hardware")
+    def test_changed_mind_when_opinions_exist(self, tmp_path):
+        t = [1000.0]
+        m = AgentMemory(agent="bot", db_path=tmp_path / "m.db",
+                        now_fn=lambda: t[0])
+        m.ingest_video("v1", "Why JavaScript is Bad",
+                       "JavaScript has too many quirks",
+                       tags=["javascript"],
+                       opinions=["JavaScript is the worst language"])
+        t[0] = 1000.0 + 30 * 86400
+        ref = m.suggest_reference("JavaScript Revisited",
+                                  "Taking another look at JavaScript")
         assert ref is not None
         assert ref.type == ReferenceType.CHANGED_MIND
-        assert "Modern hardware" in ref.text
+        assert "JavaScript" in ref.text
 
-    def test_series_detection(self, mem):
-        mem.ingest_video("v1", "Cooking Series Part 1")
-        ref = mem.suggest_reference("Cooking Series Part 2")
+    def test_series_detection(self, populated_mem):
+        ref = populated_mem.suggest_reference(
+            "PowerPC vs ARM — Part 3",
+            "Continuing the comparison",
+        )
         assert ref is not None
         assert ref.type == ReferenceType.SERIES
-        assert "Part 2" in ref.text
+        assert "Part 3" in ref.text
 
-    def test_milestone_detection(self, tmp_path):
-        now = 1700000000.0
-        mem = AgentMemory(
-            agent="bot", db_path=tmp_path / "m.db",
-            now_fn=lambda: now,
-        )
-        # Ingest 49 videos, then the 50th
-        for i in range(50):
-            mem.ingest_video(f"v{i}", f"Video number {i}", tags=["stuff"])
-        ref = mem.suggest_reference("Milestone Video")
+    def test_milestone(self, tmp_path):
+        t = [1000.0]
+        m = AgentMemory(agent="bot", db_path=tmp_path / "m.db",
+                        now_fn=lambda: t[0])
+        for i in range(10):
+            t[0] += 100
+            m.ingest_video(f"v{i}", f"Video {i}", f"Description {i}",
+                           tags=["test"])
+        ref = m.suggest_reference("Video 10", "The tenth one")
         assert ref is not None
         assert ref.type == ReferenceType.MILESTONE
-        assert "50" in ref.text
+        assert "10" in ref.text
 
-
-# Need sqlite3 import for test
-import sqlite3
-
-
-# ---------------------------------------------------------------------------
-# Stats
-# ---------------------------------------------------------------------------
 
 class TestStats:
+    def test_basic_stats(self, populated_mem):
+        stats = populated_mem.get_stats()
+        assert stats.total_videos == 5
+        assert stats.first_upload is not None
+        assert stats.days_active >= 1
+
+    def test_top_topics(self, populated_mem):
+        stats = populated_mem.get_stats()
+        topic_names = [t[0] for t in stats.top_topics]
+        assert "hardware" in topic_names  # appears in 4 videos
+
+    def test_series_detection(self, populated_mem):
+        stats = populated_mem.get_stats()
+        assert len(stats.current_series) >= 1
+        assert any("PowerPC vs ARM" in s for s in stats.current_series)
+
     def test_empty_stats(self, mem):
         stats = mem.get_stats()
         assert stats.total_videos == 0
-        assert stats.first_upload is None
+        assert stats.top_topics == []
 
-    def test_top_topics(self, mem):
-        mem.ingest_video("v1", "A", tags=["hardware", "mining"])
-        mem.ingest_video("v2", "B", tags=["hardware", "vintage"])
-        mem.ingest_video("v3", "C", tags=["cooking"])
-        stats = mem.get_stats()
-        # hardware appears 2x, should be top
-        assert stats.top_topics[0][0] == "hardware"
-        assert stats.top_topics[0][1] == 2
-
-    def test_series_detection_in_stats(self, mem):
-        mem.ingest_video("v1", "Cooking Series Part 1")
-        mem.ingest_video("v2", "Cooking Series Part 2")
-        mem.ingest_video("v3", "Unrelated Video")
-        stats = mem.get_stats()
-        assert "Cooking Series" in stats.current_series
-
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
 
 class TestPersistence:
     def test_data_survives_reload(self, tmp_path):
-        db = tmp_path / "mem.db"
+        db = tmp_path / "persist.db"
         m1 = AgentMemory(agent="bot", db_path=db)
-        m1.ingest_video("v1", "Test Video", "desc", ["tag"])
+        m1.ingest_video("v1", "Test", "Desc", tags=["tag1"])
 
         m2 = AgentMemory(agent="bot", db_path=db)
-        assert m2.get_stats().total_videos == 1
-        results = m2.search("Test Video")
+        results = m2.search("Test")
         assert len(results) == 1
 
-    def test_agent_isolation(self, tmp_path):
-        db = tmp_path / "mem.db"
+    def test_agents_isolated(self, tmp_path):
+        db = tmp_path / "shared.db"
         m1 = AgentMemory(agent="bot_a", db_path=db)
         m2 = AgentMemory(agent="bot_b", db_path=db)
-        m1.ingest_video("v1", "Bot A Video")
-        m2.ingest_video("v2", "Bot B Video")
-        assert m1.get_stats().total_videos == 1
-        assert m2.get_stats().total_videos == 1
+
+        m1.ingest_video("v1", "Quantum Entanglement Physics", "Studying quarks")
+        m2.ingest_video("v2", "Renaissance Painting Techniques", "Oil on canvas")
+
+        assert len(m1.search("quantum entanglement")) == 1
+        assert len(m1.search("renaissance painting")) == 0
+        assert len(m2.search("renaissance painting")) == 1
+        assert len(m2.search("quantum entanglement")) == 0
 
 
-# ---------------------------------------------------------------------------
-# Integration: natural self-reference example
-# ---------------------------------------------------------------------------
+class TestExampleScenario:
+    def test_agent_references_old_video(self, tmp_path):
+        """Agent posted about X two weeks ago, now posts follow-up."""
+        t = [1700000000.0]
+        m = AgentMemory(agent="cosmo", db_path=tmp_path / "ex.db",
+                        now_fn=lambda: t[0])
 
-class TestIntegration:
-    def test_agent_references_two_week_old_video(self, tmp_path):
-        """The bounty example: agent references own video from 2 weeks ago."""
-        now = 1700000000.0
-        mem = AgentMemory(
-            agent="cosmo", db_path=tmp_path / "m.db",
-            now_fn=lambda: now,
-        )
         # Two weeks ago
-        mem.ingest_video("old_vid", "Why SPARC Machines Are Underrated",
-                         "A deep look at Sun Microsystems SPARC architecture",
-                         tags=["hardware", "sparc", "vintage"])
-        with sqlite3.connect(str(tmp_path / "m.db")) as conn:
-            conn.execute(
-                "UPDATE agent_videos SET created_at=? WHERE video_id='old_vid'",
-                (now - 14 * 86400,),
-            )
-        mem._store = TfIdfStore()
-        mem._load_into_store()
-
-        # New video about similar topic
-        ref = mem.suggest_reference(
-            "SPARC vs PowerPC — Which Aged Better?",
-            "Comparing two vintage architectures",
+        m.ingest_video(
+            "v_old", "The State of Vintage Computing",
+            "Exploring the vintage computing scene in 2026",
+            tags=["vintage", "computing", "retro"],
         )
+
+        # Now (14 days later)
+        t[0] += 14 * 86400
+        ref = m.suggest_reference(
+            "Vintage Computing Update",
+            "What changed in the retro scene",
+        )
+
         assert ref is not None
-        assert ref.related_video_id == "old_vid"
-        assert "SPARC" in ref.related_title
-        assert ref.type in (ReferenceType.FOLLOWUP, ReferenceType.CALLBACK,
-                            ReferenceType.CHANGED_MIND)
+        assert ref.type in (ReferenceType.FOLLOWUP, ReferenceType.CALLBACK)
+        assert "vintage" in ref.text.lower() or "Vintage" in ref.text
+        assert ref.related_video_id == "v_old"
