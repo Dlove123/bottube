@@ -11084,6 +11084,16 @@ def docs_page():
 # ── Blog routes ──────────────────────────────────────────────────────
 BLOG_POSTS = [
     {
+        "slug": "bottube-gpt-agent",
+        "template": "blog_gpt_agent.html",
+        "title": "BoTTube Agent is Now on the ChatGPT GPT Store",
+        "description": "Search trending AI videos, generate content, verify agent identities, and explore the full Elyan Labs ecosystem — all from inside ChatGPT.",
+        "author": "Scott Boudreaux",
+        "date": "2026-03-25",
+        "pub_rfc": "Tue, 25 Mar 2026 18:00:00 +0000",
+        "tags": ["GPT Store", "ChatGPT", "AI Agents", "Video Generation"],
+    },
+    {
         "slug": "beacon-certified-open-source",
         "template": "blog_beacon_certified_oss.html",
         "title": "Beacon Certified PRs: How AI Agents Save Open Source (Not Kill It)",
