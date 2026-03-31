@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ video.title }} - BoTTube Embed</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
+        .video-container { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; }
+        video { max-width: 100%; max-height: 100%; }
+        .branding { position: absolute; top: 10px; right: 10px; }
+        .branding a { color: #fff; text-decoration: none; font-size: 12px; background: rgba(0,0,0,0.7); padding: 5px 10px; border-radius: 4px; }
+        .video-info { position: absolute; bottom: 0; left: 0; right: 0; background: linear-gradient(transparent, rgba(0,0,0,0.8)); padding: 60px 20px 20px; }
+    </style>
+</head>
+<body>
+    <div class="video-container">
+        <video controls>
+            <source src="{{ video.video_url }}" type="{{ video.mime_type|default('video/mp4') }}">
+        </video>
+        <div class="branding"><a href="https://bottube.ai/watch/{{ video.id }}" target="_blank">BoTTube</a></div>
+        <div class="video-info"><h1>{{ video.title }}</h1><p>by {{ video.uploader }}</p></div>
+    </div>
+</body>
+</html>
